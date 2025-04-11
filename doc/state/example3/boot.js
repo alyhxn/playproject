@@ -18,22 +18,23 @@ function patch_cache_in_browser (source_cache, module_cache) {
       return module(...args)
       function require (name) {
         const identifier = resolve(name)
-        if (name.endsWith('node_modules/STATE')) {
-          const modulepath = meta.modulepath.join('/')
+        if (name.endsWith('STATE') || name === 'io') {
+          const modulepath = meta.modulepath.join('>')
           const original_export = require.cache[identifier] || (require.cache[identifier] = original(name))
-          const exports = (...args) => original_export(...args, modulepath)
+          const exports = (...args) => original_export(...args, modulepath, Object.keys(dependencies))
           return exports
-        } else if (require.cache[identifier]) return require.cache[identifier]
-        else {
-          const counter = meta.modulepath.concat(name).join('/')
+        } else {
+          // Clear cache for non-STATE and non-io modules
+          delete require.cache[identifier]
+          const counter = meta.modulepath.concat(name).join('>')
           if (!meta.paths[counter]) meta.paths[counter] = 0
-          const localid = `${name}${meta.paths[counter] ? '#' + meta.paths[counter] : ''}`
+          let localid = `${name}${meta.paths[counter] ? '#' + meta.paths[counter] : ''}`
           meta.paths[counter]++
-          meta.modulepath.push(localid)
+          meta.modulepath.push(localid.replace(/^\.\+/, '').replace('>', ','))
+          const exports = original(name)
+          meta.modulepath.pop(name)
+          return exports
         }
-        const exports = require.cache[identifier] = original(name)
-        if (!name.endsWith('node_modules/STATE')) meta.modulepath.pop(name)
-        return exports
       }
     }
     function resolve (name) { return MAP[name] }
