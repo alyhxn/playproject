@@ -204,12 +204,12 @@ async function onbatch(batch){
 - `type` refers to the `dataset_type` used in fallbacks. The key names need to match. E.g. see `template.js`
 - `paths` refers to the paths to the files inside the dataset.
 
-**sdb.get_sub**  
+**`sdb.get_sub`**  
   @TODO
-**sdb.drive**  
+**`sdb.drive`**  
 The `sdb.drive` object provides an interface for managing datasets and files attached to the current node. It allows you to list, retrieve, add, and check files within datasets defined in the module's state.
 
-- **sdb.drive.list(path?)**
+- **`sdb.drive.list(path?)`**
   - Lists all dataset names (as folders) attached to the current node.
   - If a `path` (dataset name) is provided, returns the list of file names within that dataset.
   - Example:
@@ -218,7 +218,7 @@ The `sdb.drive` object provides an interface for managing datasets and files att
     const files = sdb.drive.list('mydata/'); // ['file1.json', 'file2.txt']
     ```
 
-- **sdb.drive.get(path)**
+- **`sdb.drive.get(path)`**
   - Retrieves a file object from a dataset.
   - `path` should be in the format `'dataset_name/filename.ext'`.
   - Returns an object: `{ id, name, type, raw }` or `null` if not found.
@@ -228,7 +228,7 @@ The `sdb.drive` object provides an interface for managing datasets and files att
     // file: { id: '...', name: 'file1.json', type: 'json', raw: ... }
     ```
 
-- **sdb.drive.put(path, buffer)**
+- **`sdb.drive.put(path, buffer)`**
   - Adds a new file to a dataset.
   - `path` is `'dataset_name/filename.ext'`.
   - `buffer` is the file content (object, string, etc.).
@@ -238,7 +238,7 @@ The `sdb.drive` object provides an interface for managing datasets and files att
     sdb.drive.put('mydata/newfile.txt', 'Hello World');
     ```
 
-- **sdb.drive.has(path)**
+- **`sdb.drive.has(path)`**
   - Checks if a file exists in a dataset.
   - `path` is `'dataset_name/filename.ext'`.
   - Returns `true` if the file exists, otherwise `false`.
@@ -246,7 +246,7 @@ The `sdb.drive` object provides an interface for managing datasets and files att
     ```js
     if (sdb.drive.has('mydata/file1.json')) { /* ... */ }
     ```
-**sdb.get(sid)**  
+**`sdb.get(sid)`**  
 The `sdb.get` function returns the **readonly** drive of a sub-node using its `sid`. The returned `drive` object has all properties as mentioned above except for `put`.
 Example:
 ```js
