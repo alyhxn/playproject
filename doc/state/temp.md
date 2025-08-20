@@ -248,6 +248,11 @@ The `sdb.drive` object provides an interface for managing datasets and files att
     ```
 **sdb.get(sid)**  
 The `sdb.get` function returns the **readonly** drive of a sub-node using its `sid`. The returned `drive` object has all properties as mentioned above except for `put`.
+Example:
+```js
+  const sub_drive = sdb.get(sub[0].sid)
+```
+Click [here](https://github.com/alyhxn/playproject/blob/main/doc/state/example/node_modules/nav/nav.js#L51) to view a detailed example
 
 **Notes:**
 - Dataset names are defined in the fallback structure and must be unique within a node.

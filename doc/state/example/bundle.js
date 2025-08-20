@@ -518,7 +518,8 @@ module.exports = localdb
 
 function localdb () {
   const prefix = '153/'
-  return { add, read_all, read, drop, push, length, append, find, wash, get_id }
+  console.log('hello')
+  return { add, read_all, read, drop, push, length, append, find, wash, gen_id }
 
   function length (keys) {
     const address = prefix + keys.join('/')
@@ -617,7 +618,7 @@ function localdb () {
   function wash () {
     localStorage.clear()
   }
-  function get_id (raw_id) {
+  function gen_id (raw_id) {
     const seed = raw_id.replace(/:0$/, "")
     const copies = Object.keys(read_all(['state', seed]))
     if (copies.length) {
