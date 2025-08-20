@@ -960,7 +960,6 @@ async function nav(opts) {
   // ----------------------------------------
   // ELEMENTS
   // ----------------------------------------
-  console.log(subs)
   { //menu
     main.append(await menu(subs[0]), await menu(subs[1]), await menu(subs[2]), await menu_hover(subs[3]), await btn(subs[4]), await btn(subs[5]))
   }
@@ -971,7 +970,7 @@ async function nav(opts) {
   console.log('sub_drive', await sub_drive.get('style/theme.css'))
   
   sub_drive.on(() => {
-    console.log('sub_drive change', sub_drive.list('style/'))
+    console.log('sub_drive changed', sub_drive.list('style/'))
   })
 
   return el
@@ -996,7 +995,7 @@ async function nav(opts) {
 }
 
 
-function fallback_module (args, {address}) { // -> set database defaults or load from database
+function fallback_module (args) { // -> set database defaults or load from database
   return { api, _: { 'menu':{ $: menu$ }, btn: { $: btn$ } } }
   function api () {
     const links = ['Marketing', 'Design', 'Web Dev', 'Ad Compaign']
@@ -1054,8 +1053,7 @@ function fallback_module (args, {address}) { // -> set database defaults or load
       if (args) data.drive['lang/']['en-us.json'].raw.title = args
       data.drive['theme/'] = {
         'style.css': {
-          $ref: 'btn.css',
-          address
+          $ref: 'btn.css'
         }
       }
       return data
