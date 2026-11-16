@@ -1,4 +1,3198 @@
 (function(){function r(e,n,t){function o(i,f){if(!n[i]){if(!e[i]){var c="function"==typeof require&&require;if(!f&&c)return c(i,!0);if(u)return u(i,!0);var a=new Error("Cannot find module '"+i+"'");throw a.code="MODULE_NOT_FOUND",a}var p=n[i]={exports:{}};e[i][0].call(p.exports,function(r){var n=e[i][1][r];return o(n||r)},p,p.exports,r,e,n,t)}return n[i].exports}for(var u="function"==typeof require&&require,i=0;i<t.length;i++)o(t[i]);return o}return r})()({1:[function(require,module,exports){
+
+},{}],2:[function(require,module,exports){
+(function (__filename){(function (){
+const STATE = require('STATE')
+const statedb = STATE(__filename)
+const { get } = statedb(fallback_module)
+const net = require('./net_helper')
+
+module.exports = graph_explorer
+
+async function graph_explorer (opts, invite) {
+  /******************************************************************************
+  COMPONENT INITIALIZATION
+    - This sets up the initial state, variables, and the basic DOM structure.
+    - It also initializes the IntersectionObserver for virtual scrolling and
+      sets up the watcher for state changes.
+  ******************************************************************************/
+  const { id, sdb } = await get(opts.sid)
+  const { drive } = sdb
+
+  let vertical_scroll_value = 0
+  let horizontal_scroll_value = 0
+  let selected_instance_paths = []
+  let confirmed_instance_paths = []
+  let db = null // Database for entries
+  let instance_states = {} // Holds expansion state {expanded_subs, expanded_hubs} for each node instance.
+  let search_state_instances = {}
+  let search_entry_states = {} // Holds expansion state for search mode interactions separately
+  let view = [] // A flat array representing the visible nodes in the graph.
+  let mode // Current mode of the graph explorer, can be set to 'default', 'menubar' or 'search'. Its value should be set by the `mode` file in the drive.
+  let previous_mode
+  let search_query = ''
+  let hubs_flag = 'default' // Flag for hubs behavior: 'default' (prevent duplication), 'true' (no duplication prevention), 'false' (disable hubs)
+  let selection_flag = 'default' // Flag for selection behavior: 'default' (enable selection), 'false' (disable selection)
+  let recursive_collapse_flag = false // Flag for recursive collapse: true (recursive), false (parent level only)
+  let drive_updated_by_scroll = false // Flag to prevent `onbatch` from re-rendering on scroll updates.
+  let drive_updated_by_toggle = false // Flag to prevent `onbatch` from re-rendering on toggle updates.
+  let drive_updated_by_search = false // Flag to prevent `onbatch` from re-rendering on search updates.
+  let drive_updated_by_last_clicked = false // Flag to prevent `onbatch` from re-rendering on last clicked node updates.
+  let ignore_drive_updated_by_scroll = false // Prevent scroll flag.
+  let drive_updated_by_match = false // Flag to prevent `onbatch` from re-rendering on matching entry updates.
+  let drive_updated_by_tracking = false // Flag to prevent `onbatch` from re-rendering on view order tracking updates.
+  let drive_updated_by_undo = false // Flag to prevent onbatch from re-rendering on undo updates
+  let is_loading_from_drive = false // Flag to prevent saving to drive during initial load
+  let multi_select_enabled = false // Flag to enable multi-select mode without ctrl key
+  let select_between_enabled = false // Flag to enable select between mode
+  let select_between_first_node = null // First node selected in select between mode
+  let duplicate_entries_map = {}
+  let view_order_tracking = {} // Tracks instance paths by base path in real time as they are added into the view through toggle expand/collapse actions.
+  let is_rendering = false // Flag to prevent concurrent rendering operations in virtual scrolling.
+  let spacer_element = null // DOM element used to manage scroll position when hubs are toggled.
+  let spacer_initial_height = 0
+  let hub_num = 0 // Counter for expanded hubs.
+  let last_clicked_node = null // Track the last clicked node instance path for highlighting.
+  let root_wand_state = null // Store original root wand state when replaced with jump button
+  const manipulated_inside_search = {}
+  let keybinds = {} // Store keyboard navigation bindings
+  let undo_stack = [] // Stack to track drive state changes for undo functionality
+
+  const { io, _ } = net(id)
+  io.on = {
+    storage: onmessage
+  }
+  if (!invite || typeof invite !== 'function') throw new Error('graph_explorer requires a net_helper invite')
+  io.accept(invite)
+
+  // Create db object that communicates via protocol messages
+  db = create_db()
+
+  const el = document.createElement('div')
+  el.className = 'graph-explorer-wrapper'
+  const shadow = el.attachShadow({ mode: 'closed' })
+  shadow.innerHTML = `
+    <div class="graph-container"></div>
+    <div class="searchbar"></div>
+    <div class="menubar"></div>
+  `
+  const searchbar = shadow.querySelector('.searchbar')
+  const menubar = shadow.querySelector('.menubar')
+  const container = shadow.querySelector('.graph-container')
+
+  document.body.style.margin = 0
+
+  let scroll_update_pending = false
+  container.onscroll = onscroll
+
+  let start_index = 0
+  let end_index = 0
+  const chunk_size = 50
+  const max_rendered_nodes = chunk_size * 3
+  let node_height
+
+  const top_sentinel = document.createElement('div')
+  const bottom_sentinel = document.createElement('div')
+
+  const observer = new IntersectionObserver(handle_sentinel_intersection, {
+    root: container,
+    rootMargin: '500px 0px',
+    threshold: 0
+  })
+
+  // Define handlers for different data types from the drive, called by `onbatch`.
+  const on = {
+    style: inject_style,
+    runtime: on_runtime,
+    mode: on_mode,
+    flags: on_flags,
+    keybinds: on_keybinds,
+    undo: on_undo
+  }
+  // Start watching for state changes. This is the main trigger for all updates.
+  await sdb.watch(onbatch)
+
+  document.onkeydown = handle_keyboard_navigation
+
+  return el
+
+  /******************************************************************************
+  ESSAGE HANDLING
+    - Handles incoming messages and sends outgoing messages.
+    - Messages follow standardized net_helper format: { head, refs, type, data, meta }
+  ******************************************************************************/
+  function onmessage (msg) {
+    const { type, data } = msg
+    const on_message_types = {
+      set_mode: handle_set_mode,
+      set_search_query: handle_set_search_query,
+      select_nodes: handle_select_nodes,
+      expand_node: handle_expand_node,
+      collapse_node: handle_collapse_node,
+      toggle_node: handle_toggle_node,
+      get_selected: handle_get_selected,
+      get_confirmed: handle_get_confirmed,
+      clear_selection: handle_clear_selection,
+      set_flag: handle_set_flag,
+      scroll_to_node: handle_scroll_to_node,
+      db_response: handle_db_response,
+      db_initialized: handle_db_initialized
+    }
+
+    const handler = on_message_types[type]
+    if (handler) handler(data)
+    else console.warn(`[graph_explorer-protocol] Unknown message type: ${type}`, msg)
+
+    function handle_db_response () {
+      db.handle_response(msg)
+    }
+
+    function handle_set_mode (data) {
+      const { mode: new_mode } = data
+      if (new_mode && ['default', 'menubar', 'search'].includes(new_mode)) {
+        update_drive_state({ type: 'mode/current_mode', message: new_mode })
+        send_message({ type: 'mode_changed', refs: { cause: msg.head }, data: { mode: new_mode } })
+      }
+    }
+
+    function handle_set_search_query (data) {
+      const { query } = data
+      if (typeof query === 'string') {
+        search_query = query
+        drive_updated_by_search = true
+        update_drive_state({ type: 'mode/search_query', message: query })
+        if (mode === 'search') perform_search(query)
+        send_message({ type: 'search_query_changed', refs: { cause: msg.head }, data: { query } })
+      }
+    }
+
+    function handle_select_nodes (data) {
+      const { instance_paths } = data
+      if (Array.isArray(instance_paths)) {
+        update_drive_state({ type: 'runtime/selected_instance_paths', message: instance_paths })
+        send_message({ type: 'selection_changed', refs: { cause: msg.head }, data: { selected: instance_paths } })
+      }
+    }
+
+    function handle_expand_node (data) {
+      const { instance_path, expand_subs = true, expand_hubs = false } = data
+      if (instance_path && instance_states[instance_path]) {
+        instance_states[instance_path].expanded_subs = expand_subs
+        instance_states[instance_path].expanded_hubs = expand_hubs
+        drive_updated_by_toggle = true
+        update_drive_state({ type: 'runtime/instance_states', message: instance_states })
+        send_message({ type: 'node_expanded', refs: { cause: msg.head }, data: { instance_path, expand_subs, expand_hubs } })
+      }
+    }
+
+    function handle_collapse_node (data) {
+      const { instance_path } = data
+      if (instance_path && instance_states[instance_path]) {
+        instance_states[instance_path].expanded_subs = false
+        instance_states[instance_path].expanded_hubs = false
+        drive_updated_by_toggle = true
+        update_drive_state({ type: 'runtime/instance_states', message: instance_states })
+        send_message({ type: 'node_collapsed', refs: { cause: msg.head }, data: { instance_path } })
+      }
+    }
+
+    async function handle_toggle_node (data) {
+      const { instance_path, toggle_type = 'subs' } = data
+      if (instance_path && instance_states[instance_path]) {
+        if (toggle_type === 'subs') {
+          await toggle_subs(instance_path)
+        } else if (toggle_type === 'hubs') {
+          await toggle_hubs(instance_path)
+        }
+        send_message({ type: 'node_toggled', refs: { cause: msg.head }, data: { instance_path, toggle_type } })
+      }
+    }
+
+    function handle_get_selected (data) {
+      send_message({ type: 'selected_nodes', refs: { cause: msg.head }, data: { selected: selected_instance_paths } })
+    }
+
+    function handle_get_confirmed (data) {
+      send_message({ type: 'confirmed_nodes', refs: { cause: msg.head }, data: { confirmed: confirmed_instance_paths } })
+    }
+
+    function handle_clear_selection (data) {
+      update_drive_state({ type: 'runtime/selected_instance_paths', message: [] })
+      update_drive_state({ type: 'runtime/confirmed_selected', message: [] })
+      send_message({ type: 'selection_cleared', refs: { cause: msg.head }, data: {} })
+    }
+
+    function handle_set_flag (data) {
+      const { flag_type, value } = data
+      if (flag_type === 'hubs' && ['default', 'true', 'false'].includes(value)) {
+        update_drive_state({ type: 'flags/hubs', message: value })
+      } else if (flag_type === 'selection') {
+        update_drive_state({ type: 'flags/selection', message: value })
+      } else if (flag_type === 'recursive_collapse') {
+        update_drive_state({ type: 'flags/recursive_collapse', message: value })
+      }
+      send_message({ type: 'flag_changed', refs: { cause: msg.head }, data: { flag_type, value } })
+    }
+
+    function handle_scroll_to_node (data) {
+      const { instance_path } = data
+      const node_index = view.findIndex(n => n.instance_path === instance_path)
+      if (node_index !== -1) {
+        const scroll_position = node_index * node_height
+        container.scrollTop = scroll_position
+        send_message({ type: 'scrolled_to_node', refs: { cause: msg.head }, data: { instance_path, scroll_position } })
+      }
+    }
+  }
+  async function handle_db_initialized (data) {
+    // Page.js, trigger initial render
+    // After receiving entries, ensure the root node state is initialized and trigger the first render.
+    const root_path = '/'
+    if (await db.has(root_path)) {
+      const root_instance_path = '|/'
+      if (!instance_states[root_instance_path]) {
+        instance_states[root_instance_path] = {
+          expanded_subs: true,
+          expanded_hubs: false
+        }
+      }
+      // don't rebuild view if we're in search mode with active query
+      if (mode === 'search' && search_query) {
+        console.log('[SEARCH DEBUG] on_entries: skipping build_and_render_view in Search Mode with query:', search_query)
+        perform_search(search_query)
+      } else {
+        // tracking will be initialized later if drive data is empty
+        build_and_render_view()
+      }
+    } else {
+      console.warn('Root path "/" not found in entries. Clearing view.')
+      view = []
+      if (container) container.replaceChildren()
+    }
+  }
+  function send_message ({ type, refs = {}, data = {} }) {
+    if (!_.storage) throw new Error('graph_explorer net_helper channel "storage" is not connected')
+    return _.storage(type, refs, data)
+  }
+
+  function create_db () {
+    // Pending requests map: key is net_helper message head, value is {resolve, reject}
+    const pending_requests = new Map()
+    const early_responses = new Map()
+
+    return {
+      // All operations are async via protocol messages
+      get: (path) => send_db_request('db_get', { path }),
+      has: (path) => send_db_request('db_has', { path }),
+      is_empty: () => send_db_request('db_is_empty', {}),
+      root: () => send_db_request('db_root', {}),
+      keys: () => send_db_request('db_keys', {}),
+      raw: () => send_db_request('db_raw', {}),
+      // Handle responses from page.js
+      handle_response: (msg) => {
+        if (!msg.refs || !msg.refs.cause) {
+          console.warn('[graph_explorer] Response missing refs.cause:', msg)
+          return
+        }
+        const request_head_key = JSON.stringify(msg.refs.cause)
+        const pending = pending_requests.get(request_head_key)
+        if (pending) {
+          pending.resolve(msg.data.result)
+          pending_requests.delete(request_head_key)
+        } else {
+          early_responses.set(request_head_key, msg)
+        }
+      }
+    }
+
+    function send_db_request (operation, params) {
+      return new Promise((resolve, reject) => {
+        const head = send_message({ type: operation, refs: {}, data: params })
+        const head_key = JSON.stringify(head)
+        pending_requests.set(head_key, { resolve, reject })
+        const early_response = early_responses.get(head_key)
+        if (early_response) {
+          early_responses.delete(head_key)
+          db.handle_response(early_response)
+        }
+      })
+    }
+  }
+
+  /******************************************************************************
+  STATE AND DATA HANDLING
+    - These functions process incoming data from the STATE module's `sdb.watch`.
+    - `onbatch` is the primary entry point.
+  ******************************************************************************/
+  async function onbatch (batch) {
+    console.log('[SEARCH DEBUG] onbatch caled:', {
+      mode,
+      search_query,
+      last_clicked_node,
+      feedback_flags: {
+        scroll: drive_updated_by_scroll,
+        toggle: drive_updated_by_toggle,
+        search: drive_updated_by_search,
+        match: drive_updated_by_match,
+        tracking: drive_updated_by_tracking
+      }
+    })
+
+    // Prevent feedback loops from scroll or toggle actions.
+    if (check_and_reset_feedback_flags()) {
+      console.log('[SEARCH DEBUG] onbatch prevented by feedback flags')
+      return
+    }
+
+    for (const { type, paths } of batch) {
+      if (!paths || !paths.length) continue
+      const data = await Promise.all(
+        paths.map(path => batch_get(path))
+      )
+      // Call the appropriate handler based on `type`.
+      const func = on[type]
+      func ? await func({ data, paths }) : fail(data, type)
+    }
+
+    function batch_get (path) {
+      return drive
+        .get(path)
+        .then(file => (file ? file.raw : null))
+        .catch(e => {
+          console.error(`Error getting file from drive: ${path}`, e)
+          return null
+        })
+    }
+  }
+
+  function fail (data, type) {
+    throw new Error(`Invalid message type: ${type}`, { cause: { data, type } })
+  }
+
+  async function on_runtime ({ data, paths }) {
+    const on_runtime_paths = {
+      'node_height.json': handle_node_height,
+      'vertical_scroll_value.json': handle_vertical_scroll,
+      'horizontal_scroll_value.json': handle_horizontal_scroll,
+      'selected_instance_paths.json': handle_selected_paths,
+      'confirmed_selected.json': handle_confirmed_paths,
+      'instance_states.json': handle_instance_states,
+      'search_entry_states.json': handle_search_entry_states,
+      'last_clicked_node.json': handle_last_clicked_node,
+      'view_order_tracking.json': handle_view_order_tracking
+    }
+    let needs_render = false
+    const render_nodes_needed = new Set()
+
+    paths.forEach((path, i) => runtime_handler(path, data[i]))
+
+    if (needs_render) {
+      if (mode === 'search' && search_query) {
+        console.log('[SEARCH DEBUG] on_runtime: Skipping build_and_render_view in search mode with query:', search_query)
+        await perform_search(search_query)
+      } else {
+        await build_and_render_view()
+      }
+    } else if (render_nodes_needed.size > 0) {
+      render_nodes_needed.forEach(re_render_node)
+    }
+
+    function runtime_handler (path, data) {
+      if (data === null) return
+      const value = parse_json_data(data, path)
+      if (value === null) return
+
+      // Extract filename from path and use handler if available
+      const filename = path.split('/').pop()
+      const handler = on_runtime_paths[filename]
+      if (handler) {
+        const result = handler({ value, render_nodes_needed })
+        if (result?.needs_render) needs_render = true
+      }
+    }
+
+    function handle_node_height ({ value }) {
+      node_height = value
+    }
+
+    function handle_vertical_scroll ({ value }) {
+      if (typeof value === 'number') vertical_scroll_value = value
+    }
+
+    function handle_horizontal_scroll ({ value }) {
+      if (typeof value === 'number') horizontal_scroll_value = value
+    }
+
+    function handle_selected_paths ({ value, render_nodes_needed }) {
+      selected_instance_paths = process_path_array_update({
+        current_paths: selected_instance_paths,
+        value,
+        render_set: render_nodes_needed,
+        name: 'selected_instance_paths'
+      })
+    }
+
+    function handle_confirmed_paths ({ value, render_nodes_needed }) {
+      confirmed_instance_paths = process_path_array_update({
+        current_paths: confirmed_instance_paths,
+        value,
+        render_set: render_nodes_needed,
+        name: 'confirmed_selected'
+      })
+    }
+
+    function handle_instance_states ({ value }) {
+      if (typeof value === 'object' && value && !Array.isArray(value)) {
+        instance_states = value
+        return { needs_render: true }
+      } else {
+        console.warn('instance_states is not a valid object, ignoring.', value)
+      }
+    }
+
+    function handle_search_entry_states ({ value }) {
+      if (typeof value === 'object' && value && !Array.isArray(value)) {
+        search_entry_states = value
+        if (mode === 'search') return { needs_render: true }
+      } else {
+        console.warn('search_entry_states is not a valid object, ignoring.', value)
+      }
+    }
+
+    function handle_last_clicked_node ({ value, render_nodes_needed }) {
+      const old_last_clicked = last_clicked_node
+      last_clicked_node = typeof value === 'string' ? value : null
+      if (old_last_clicked) render_nodes_needed.add(old_last_clicked)
+      if (last_clicked_node) render_nodes_needed.add(last_clicked_node)
+    }
+
+    function handle_view_order_tracking ({ value }) {
+      if (typeof value === 'object' && value && !Array.isArray(value)) {
+        is_loading_from_drive = true
+        view_order_tracking = value
+        is_loading_from_drive = false
+        if (Object.keys(view_order_tracking).length === 0) {
+          initialize_tracking_from_current_state()
+        }
+        return { needs_render: true }
+      } else {
+        console.warn('view_order_tracking is not a valid object, ignoring.', value)
+      }
+    }
+  }
+
+  async function on_mode ({ data, paths }) {
+    const on_mode_paths = {
+      'current_mode.json': handle_current_mode,
+      'previous_mode.json': handle_previous_mode,
+      'search_query.json': handle_search_query,
+      'multi_select_enabled.json': handle_multi_select_enabled,
+      'select_between_enabled.json': handle_select_between_enabled
+    }
+    let new_current_mode, new_previous_mode, new_search_query, new_multi_select_enabled, new_select_between_enabled
+
+    paths.forEach((path, i) => mode_handler(path, data[i]))
+
+    if (typeof new_search_query === 'string') search_query = new_search_query
+    if (new_previous_mode) previous_mode = new_previous_mode
+    if (typeof new_multi_select_enabled === 'boolean') {
+      multi_select_enabled = new_multi_select_enabled
+      render_menubar() // Re-render menubar to update button text
+    }
+    if (typeof new_select_between_enabled === 'boolean') {
+      select_between_enabled = new_select_between_enabled
+      if (!select_between_enabled) select_between_first_node = null
+      render_menubar()
+    }
+
+    if (
+      new_current_mode &&
+      !['default', 'menubar', 'search'].includes(new_current_mode)
+    ) {
+      console.warn(`Invalid mode "${new_current_mode}" provided. Ignoring update.`)
+      return
+    }
+
+    if (new_current_mode === 'search' && !search_query) {
+      search_state_instances = instance_states
+    }
+    if (!new_current_mode || mode === new_current_mode) return
+
+    if (mode && new_current_mode === 'search') update_drive_state({ type: 'mode/previous_mode', message: mode })
+    mode = new_current_mode
+    render_menubar()
+    render_searchbar()
+    await handle_mode_change()
+    if (mode === 'search' && search_query) await perform_search(search_query)
+
+    function mode_handler (path, data) {
+      const value = parse_json_data(data, path)
+      if (value === null) return
+
+      const filename = path.split('/').pop()
+      const handler = on_mode_paths[filename]
+      if (handler) {
+        const result = handler({ value })
+        if (result?.current_mode !== undefined) new_current_mode = result.current_mode
+        if (result?.previous_mode !== undefined) new_previous_mode = result.previous_mode
+        if (result?.search_query !== undefined) new_search_query = result.search_query
+        if (result?.multi_select_enabled !== undefined) new_multi_select_enabled = result.multi_select_enabled
+        if (result?.select_between_enabled !== undefined) new_select_between_enabled = result.select_between_enabled
+      }
+    }
+    function handle_current_mode ({ value }) {
+      return { current_mode: value }
+    }
+
+    function handle_previous_mode ({ value }) {
+      return { previous_mode: value }
+    }
+
+    function handle_search_query ({ value }) {
+      return { search_query: value }
+    }
+
+    function handle_multi_select_enabled ({ value }) {
+      return { multi_select_enabled: value }
+    }
+
+    function handle_select_between_enabled ({ value }) {
+      return { select_between_enabled: value }
+    }
+  }
+
+  function on_flags ({ data, paths }) {
+    const on_flags_paths = {
+      'hubs.json': handle_hubs_flag,
+      'selection.json': handle_selection_flag,
+      'recursive_collapse.json': handle_recursive_collapse_flag
+    }
+
+    paths.forEach((path, i) => flags_handler(path, data[i]))
+
+    function flags_handler (path, data) {
+      const value = parse_json_data(data, path)
+      if (value === null) return
+
+      const filename = path.split('/').pop()
+      const handler = on_flags_paths[filename]
+      if (handler) {
+        const result = handler(value)
+        if (result && result.needs_render) {
+          if (mode === 'search' && search_query) {
+            console.log('[SEARCH DEBUG] on_flags: Skipping build_and_render_view in search mode with query:', search_query)
+            perform_search(search_query)
+          } else {
+            build_and_render_view()
+          }
+        }
+      }
+    }
+
+    function handle_hubs_flag (value) {
+      if (typeof value === 'string' && ['default', 'true', 'false'].includes(value)) {
+        hubs_flag = value
+        return { needs_render: true }
+      } else {
+        console.warn('hubs flag must be one of: "default", "true", "false", ignoring.', value)
+      }
+    }
+
+    function handle_selection_flag (value) {
+      selection_flag = value
+      return { needs_render: true }
+    }
+
+    function handle_recursive_collapse_flag (value) {
+      recursive_collapse_flag = value
+      return { needs_render: false }
+    }
+  }
+
+  function inject_style ({ data }) {
+    const sheet = new CSSStyleSheet()
+    sheet.replaceSync(data[0])
+    shadow.adoptedStyleSheets = [sheet]
+  }
+
+  function on_keybinds ({ data }) {
+    if (!data || data[0] == null) {
+      console.error('Keybinds data is missing or empty.')
+      return
+    }
+    const parsed_data = parse_json_data(data[0])
+    if (typeof parsed_data !== 'object' || !parsed_data) {
+      console.error('Parsed keybinds data is not a valid object.')
+      return
+    }
+    keybinds = parsed_data
+  }
+
+  function on_undo ({ data }) {
+    if (!data || data[0] == null) {
+      console.error('Undo stack data is missing or empty.')
+      return
+    }
+    const parsed_data = parse_json_data(data[0])
+    if (typeof parsed_data !== 'object' || !parsed_data) {
+      console.error('Parsed undo stack data is not a valid Object.')
+      return
+    }
+    undo_stack = parsed_data
+  }
+
+  // Helper to persist component state to the drive.
+  async function update_drive_state ({ type, message }) {
+    // Save current state to undo stack before updating (except for some)
+    const should_track = (
+      !drive_updated_by_undo &&
+      !type.includes('scroll') &&
+      !type.includes('last_clicked') &&
+      !type.includes('view_order_tracking') &&
+      !type.includes('select_between') &&
+      type !== 'undo/stack'
+    )
+    if (should_track) {
+      await save_to_undo_stack(type)
+    }
+
+    try {
+      await drive.put(`${type}.json`, JSON.stringify(message))
+    } catch (e) {
+      const [dataset, name] = type.split('/')
+      console.error(`Failed to update ${dataset} state for ${name}:`, e)
+    }
+    if (should_track) {
+      render_menubar()
+    }
+  }
+
+  async function save_to_undo_stack (type) {
+    try {
+      const current_file = await drive.get(`${type}.json`)
+      if (current_file && current_file.raw) {
+        const snapshot = {
+          type,
+          value: current_file.raw,
+          timestamp: Date.now()
+        }
+
+        // Add to stack (limit to 50 items to prevent memory issues)
+        undo_stack.push(snapshot)
+        if (undo_stack.length > 50) {
+          undo_stack.shift()
+        }
+        drive_updated_by_undo = true
+        await drive.put('undo/stack.json', JSON.stringify(undo_stack))
+      }
+    } catch (e) {
+      console.error('Failed to save to undo stack:', e)
+    }
+  }
+
+  function get_or_create_state (states, instance_path) {
+    if (!states[instance_path]) {
+      states[instance_path] = { expanded_subs: false, expanded_hubs: false }
+    }
+    if (states[instance_path].expanded_subs === null) {
+      states[instance_path].expanded_subs = true
+    }
+
+    return states[instance_path]
+  }
+
+  async function calculate_children_pipe_trail ({
+    depth,
+    is_hub,
+    is_last_sub,
+    is_first_hub = false,
+    parent_pipe_trail,
+    parent_base_path,
+    base_path,
+    db
+  }) {
+    const children_pipe_trail = [...parent_pipe_trail]
+    const parent_entry = await db.get(parent_base_path)
+    const is_hub_on_top = base_path === parent_entry?.hubs?.[0] || base_path === '/'
+
+    if (depth > 0) {
+      if (is_hub) {
+        if (is_last_sub) {
+          children_pipe_trail.pop()
+          children_pipe_trail.push(true)
+        }
+        if (is_hub_on_top && !is_last_sub) {
+          children_pipe_trail.pop()
+          children_pipe_trail.push(true)
+        }
+        if (is_first_hub) {
+          children_pipe_trail.pop()
+          children_pipe_trail.push(false)
+        }
+      }
+      children_pipe_trail.push(is_hub || !is_last_sub)
+    }
+    return { children_pipe_trail, is_hub_on_top }
+  }
+
+  // Extracted pipe logic for reuse in both default and search modes
+  async function calculate_pipe_trail ({
+    depth,
+    is_hub,
+    is_last_sub,
+    is_first_hub = false,
+    is_hub_on_top,
+    parent_pipe_trail,
+    parent_base_path,
+    base_path,
+    db
+  }) {
+    let last_pipe = null
+    const parent_entry = await db.get(parent_base_path)
+    const calculated_is_hub_on_top = base_path === parent_entry?.hubs?.[0] || base_path === '/'
+    const final_is_hub_on_top = is_hub_on_top !== undefined ? is_hub_on_top : calculated_is_hub_on_top
+
+    if (depth > 0) {
+      if (is_hub) {
+        last_pipe = [...parent_pipe_trail]
+        if (is_last_sub) {
+          last_pipe.pop()
+          last_pipe.push(true)
+          if (is_first_hub) {
+            last_pipe.pop()
+            last_pipe.push(false)
+          }
+        }
+        if (final_is_hub_on_top && !is_last_sub) {
+          last_pipe.pop()
+          last_pipe.push(true)
+        }
+      }
+    }
+
+    const pipe_trail = (is_hub && is_last_sub) || (is_hub && final_is_hub_on_top) ? last_pipe : parent_pipe_trail
+    const product = { pipe_trail, is_hub_on_top: final_is_hub_on_top }
+    return product
+  }
+
+  /******************************************************************************
+  VIEW AND RENDERING LOGIC AND SCALING
+    - These functions build the `view` array and render the DOM.
+    - `build_and_render_view` is the main orchestrator.
+    - `build_view_recursive` creates the flat `view` array from the hierarchical data.
+    - `calculate_mobile_scale` calculates the scale factor for mobile devices.
+  ******************************************************************************/
+  async function build_and_render_view (focal_instance_path, hub_toggle = false) {
+    console.log('[SEARCH DEBUG] build_and_render_view called:', {
+      focal_instance_path,
+      hub_toggle,
+      current_mode: mode,
+      search_query,
+      last_clicked_node,
+      stack_trace: new Error().stack.split('\n').slice(1, 4).map(line => line.trim())
+    })
+
+    // This fuction should'nt be called in search mode for search
+    if (mode === 'search' && search_query && !hub_toggle) {
+      console.error('[SEARCH DEBUG] build_and_render_view called inappropriately in search mode!', {
+        mode,
+        search_query,
+        focal_instance_path,
+        stack_trace: new Error().stack.split('\n').slice(1, 6).map(line => line.trim())
+      })
+    }
+
+    const is_empty = await db.is_empty()
+    if (!db || is_empty) {
+      console.warn('No entries available to render.')
+      return
+    }
+
+    const old_view = [...view]
+    const old_scroll_top = vertical_scroll_value
+    const old_scroll_left = horizontal_scroll_value
+    let existing_spacer_height = 0
+    if (spacer_element && spacer_element.parentNode) existing_spacer_height = parseFloat(spacer_element.style.height) || 0
+
+    // Recursively build the new `view` array from the graph data.
+    view = await build_view_recursive({
+      base_path: '/',
+      parent_instance_path: '',
+      depth: 0,
+      is_last_sub: true,
+      is_hub: false,
+      parent_pipe_trail: [],
+      instance_states,
+      db
+    })
+
+    // Recalculate duplicates after view is built
+    collect_all_duplicate_entries()
+
+    const new_scroll_top = calculate_new_scroll_top({
+      old_scroll_top,
+      old_view,
+      focal_path: focal_instance_path
+    })
+    const render_anchor_index = Math.max(0, Math.floor(new_scroll_top / node_height))
+    start_index = Math.max(0, render_anchor_index - chunk_size)
+    end_index = Math.min(view.length, render_anchor_index + chunk_size)
+
+    const fragment = document.createDocumentFragment()
+    for (let i = start_index; i < end_index; i++) {
+      if (view[i]) fragment.appendChild(create_node(view[i]))
+    }
+
+    container.replaceChildren(top_sentinel, fragment, bottom_sentinel)
+    top_sentinel.style.height = `${start_index * node_height}px`
+    bottom_sentinel.style.height = `${(view.length - end_index) * node_height}px`
+
+    observer.observe(top_sentinel)
+    observer.observe(bottom_sentinel)
+
+    // Handle the spacer element used for keep entries static wrt cursor by scrolling when hubs are toggled.
+    handle_spacer_element({
+      hub_toggle,
+      existing_height: existing_spacer_height,
+      new_scroll_top,
+      sync_fn: set_scroll_and_sync
+    })
+
+    function set_scroll_and_sync () {
+      drive_updated_by_scroll = true
+      container.scrollTop = new_scroll_top
+      container.scrollLeft = old_scroll_left
+      vertical_scroll_value = container.scrollTop
+    }
+  }
+
+  // Traverses the hierarchical entries data and builds a flat `view` array for rendering.
+  async function build_view_recursive ({
+    base_path,
+    parent_instance_path,
+    parent_base_path = null,
+    depth,
+    is_last_sub,
+    is_hub,
+    is_first_hub = false,
+    parent_pipe_trail,
+    instance_states,
+    db
+  }) {
+    const instance_path = `${parent_instance_path}|${base_path}`
+    const entry = await db.get(base_path)
+    if (!entry) return []
+
+    const state = get_or_create_state(instance_states, instance_path)
+
+    const { children_pipe_trail, is_hub_on_top } = await calculate_children_pipe_trail({
+      depth,
+      is_hub,
+      is_last_sub,
+      is_first_hub,
+      parent_pipe_trail,
+      parent_base_path,
+      base_path,
+      db
+    })
+
+    const current_view = []
+    // If hubs are expanded, recursively add them to the view first (they appear above the node).
+    if (state.expanded_hubs && Array.isArray(entry.hubs)) {
+      for (let i = 0; i < entry.hubs.length; i++) {
+        const hub_path = entry.hubs[i]
+        const hub_view = await build_view_recursive({
+          base_path: hub_path,
+          parent_instance_path: instance_path,
+          parent_base_path: base_path,
+          depth: depth + 1,
+          is_last_sub: i === entry.hubs.length - 1,
+          is_hub: true,
+          is_first_hub: is_hub ? is_hub_on_top : false,
+          parent_pipe_trail: children_pipe_trail,
+          instance_states,
+          db
+        })
+        current_view.push(...hub_view)
+      }
+    }
+
+    // Calculate pipe_trail for this node
+    const { pipe_trail, is_hub_on_top: calculated_is_hub_on_top } = await calculate_pipe_trail({
+      depth,
+      is_hub,
+      is_last_sub,
+      is_first_hub,
+      is_hub_on_top,
+      parent_pipe_trail,
+      parent_base_path,
+      base_path,
+      db
+    })
+
+    current_view.push({
+      base_path,
+      instance_path,
+      depth,
+      is_last_sub,
+      is_hub,
+      is_first_hub,
+      parent_pipe_trail,
+      parent_base_path,
+      entry, // Include entry data in view to avoid async lookups during rendering
+      pipe_trail, // Pre-calculated pipe trail
+      is_hub_on_top: calculated_is_hub_on_top // Pre-calculated hub position
+    })
+
+    // If subs are expanded, recursively add them to the view (they appear below the node).
+    if (state.expanded_subs && Array.isArray(entry.subs)) {
+      for (let i = 0; i < entry.subs.length; i++) {
+        const sub_path = entry.subs[i]
+        const sub_view = await build_view_recursive({
+          base_path: sub_path,
+          parent_instance_path: instance_path,
+          parent_base_path: base_path,
+          depth: depth + 1,
+          is_last_sub: i === entry.subs.length - 1,
+          is_hub: false,
+          parent_pipe_trail: children_pipe_trail,
+          instance_states,
+          db
+        })
+        current_view.push(...sub_view)
+      }
+    }
+    return current_view
+  }
+
+  /******************************************************************************
+ 4. NODE CREATION AND EVENT HANDLING
+   - `create_node` generates the DOM element for a single node.
+   - It sets up event handlers for user interactions like selecting or toggling.
+  ******************************************************************************/
+
+  function create_node ({
+    base_path,
+    instance_path,
+    depth,
+    is_last_sub,
+    is_hub,
+    is_search_match,
+    is_direct_match,
+    is_in_original_view,
+    query,
+    entry, // Entry data is now passed from view
+    pipe_trail, // Pre-calculated pipe trail
+    is_hub_on_top // Pre-calculated hub position
+  }) {
+    if (!entry) {
+      const err_el = document.createElement('div')
+      err_el.className = 'node error'
+      err_el.textContent = `Error: Missing entry for ${base_path}`
+      return err_el
+    }
+
+    let states
+    if (mode === 'search') {
+      if (manipulated_inside_search[instance_path]) {
+        search_entry_states[instance_path] = manipulated_inside_search[instance_path]
+        states = search_entry_states
+      } else {
+        states = search_state_instances
+      }
+    } else {
+      states = instance_states
+    }
+    const state = get_or_create_state(states, instance_path)
+
+    const el = document.createElement('div')
+    el.className = `node type-${entry.type || 'unknown'}`
+    el.dataset.instance_path = instance_path
+    if (is_search_match) {
+      el.classList.add('search-result')
+      if (is_direct_match) el.classList.add('direct-match')
+      if (!is_in_original_view) el.classList.add('new-entry')
+    }
+
+    if (selected_instance_paths.includes(instance_path)) el.classList.add('selected')
+    if (confirmed_instance_paths.includes(instance_path)) el.classList.add('confirmed')
+    if (last_clicked_node === instance_path) {
+      mode === 'search' ? el.classList.add('search-last-clicked') : el.classList.add('last-clicked')
+    }
+
+    const has_hubs = hubs_flag === 'false' ? false : Array.isArray(entry.hubs) && entry.hubs.length > 0
+    const has_subs = Array.isArray(entry.subs) && entry.subs.length > 0
+
+    if (depth) {
+      el.classList.add('left-indent')
+    }
+
+    if (base_path === '/' && instance_path === '|/') return create_root_node({ state, has_subs, instance_path })
+    const prefix_class_name = get_prefix({ is_last_sub, has_subs, state, is_hub, is_hub_on_top })
+    // Use pre-calculated pipe_trail
+    const pipe_html = pipe_trail.map(p => `<span class="${p ? 'pipe' : 'blank'}"></span>`).join('')
+    const prefix_class = has_subs ? 'prefix clickable' : 'prefix'
+    const icon_class = has_hubs && base_path !== '/' ? 'icon clickable' : 'icon'
+    const entry_name = entry.name || base_path
+    const name_html = (is_direct_match && query)
+      ? get_highlighted_name(entry_name, query)
+      : entry_name
+
+    // Check if this entry appears elsewhere in the view (any duplicate)
+    let has_duplicate_entries = false
+    let is_first_occurrence = false
+    if (hubs_flag !== 'true') {
+      has_duplicate_entries = has_duplicates(base_path)
+
+      // coloring class for duplicates
+      if (has_duplicate_entries) {
+        is_first_occurrence = is_first_duplicate(base_path, instance_path)
+        if (is_first_occurrence) {
+          el.classList.add('first-matching-entry')
+        } else {
+          el.classList.add('matching-entry')
+        }
+      }
+    }
+
+    el.innerHTML = `
+      <span class="indent">${pipe_html}</span>
+      <span class="${prefix_class} ${prefix_class_name}"></span>
+      <span class="${icon_class}"></span>
+      <span class="name ${has_duplicate_entries && !is_first_occurrence ? '' : 'clickable'}">${name_html}</span>
+    `
+
+    // For matching entries, disable normal event listener and add handler to whole entry to create button for jump to next duplicate
+    if (has_duplicate_entries && !is_first_occurrence && hubs_flag !== 'true') {
+      el.onclick = jump_out_to_next_duplicate
+    } else {
+      const icon_el = el.querySelector('.icon')
+      if (icon_el && has_hubs && base_path !== '/') {
+        icon_el.onclick = (mode === 'search' && search_query)
+          ? () => toggle_search_hubs(instance_path)
+          : () => toggle_hubs(instance_path)
+      }
+
+      // Add click event to the whole first part (indent + prefix) for expanding/collapsing subs
+      if (has_subs) {
+        const indent_el = el.querySelector('.indent')
+        const prefix_el = el.querySelector('.prefix')
+
+        const toggle_subs_handler = (mode === 'search' && search_query)
+          ? () => toggle_search_subs(instance_path)
+          : () => toggle_subs(instance_path)
+
+        if (indent_el) indent_el.onclick = toggle_subs_handler
+        if (prefix_el) prefix_el.onclick = toggle_subs_handler
+      }
+
+      // Special handling for first duplicate entry - it should have normal select behavior but also show jump button
+      const name_el = el.querySelector('.name')
+      if (selection_flag !== false) {
+        if (has_duplicate_entries && is_first_occurrence && hubs_flag !== 'true') {
+          name_el.onclick = ev => jump_and_select_matching_entry(ev, instance_path)
+        } else {
+          name_el.onclick = ev => mode === 'search' ? handle_search_name_click(ev, instance_path) : select_node(ev, instance_path)
+        }
+      } else {
+        name_el.onclick = () => handle_last_clicked_node(instance_path)
+      }
+
+      function handle_last_clicked_node (instance_path) {
+        last_clicked_node = instance_path
+        drive_updated_by_last_clicked = true
+        update_drive_state({ type: 'runtime/last_clicked_node', message: instance_path })
+        update_last_clicked_styling(instance_path)
+      }
+    }
+
+    if (selected_instance_paths.includes(instance_path) || confirmed_instance_paths.includes(instance_path)) el.appendChild(create_confirm_checkbox(instance_path))
+
+    return el
+    function jump_and_select_matching_entry (ev, instance_path) {
+      if (mode === 'search') {
+        handle_search_name_click(ev, instance_path)
+      } else {
+        select_node(ev, instance_path)
+      }
+      // Also add jump button functionality for first occurrence
+      setTimeout(() => add_jump_button_to_matching_entry(el, base_path, instance_path), 10)
+    }
+    function jump_out_to_next_duplicate () {
+      last_clicked_node = instance_path
+      drive_updated_by_match = true
+      update_drive_state({ type: 'runtime/last_clicked_node', message: instance_path })
+      update_last_clicked_styling(instance_path)
+      add_jump_button_to_matching_entry(el, base_path, instance_path)
+    }
+  }
+
+  // `re_render_node` updates a single node in the DOM, used when only its selection state changes.
+  function re_render_node (instance_path) {
+    const node_data = view.find(n => n.instance_path === instance_path)
+    if (node_data) {
+      const old_node_el = shadow.querySelector(`[data-instance_path="${CSS.escape(instance_path)}"]`)
+      if (old_node_el) old_node_el.replaceWith(create_node(node_data))
+    }
+  }
+
+  // `get_prefix` determines which box-drawing character to use for the node's prefix. It gives the name of a specific CSS class.
+  function get_prefix ({ is_last_sub, has_subs, state, is_hub, is_hub_on_top }) {
+    if (!state) {
+      console.error('get_prefix called with invalid state.')
+      return 'middle-line'
+    }
+
+    // Define handlers for different prefix types based on node position
+    const on_prefix_types = {
+      hub_on_top: get_hub_on_top_prefix,
+      hub_not_on_top: get_hub_not_on_top_prefix,
+      last_sub: get_last_sub_prefix,
+      middle_sub: get_middle_sub_prefix
+    }
+    // Determine the prefix type based on node position
+    let prefix_type
+    if (is_hub && is_hub_on_top) prefix_type = 'hub_on_top'
+    else if (is_hub && !is_hub_on_top) prefix_type = 'hub_not_on_top'
+    else if (is_last_sub) prefix_type = 'last_sub'
+    else prefix_type = 'middle_sub'
+
+    const handler = on_prefix_types[prefix_type]
+
+    return handler ? handler({ state, has_subs }) : 'middle-line'
+
+    function get_hub_on_top_prefix ({ state }) {
+      const { expanded_subs, expanded_hubs } = state
+      if (expanded_subs && expanded_hubs) return 'top-cross'
+      if (expanded_subs) return 'top-tee-down'
+      if (expanded_hubs) return 'top-tee-up'
+      return 'top-line'
+    }
+
+    function get_hub_not_on_top_prefix ({ state }) {
+      const { expanded_subs, expanded_hubs } = state
+      if (expanded_subs && expanded_hubs) return 'middle-cross'
+      if (expanded_subs) return 'middle-tee-down'
+      if (expanded_hubs) return 'middle-tee-up'
+      return 'middle-line'
+    }
+
+    function get_last_sub_prefix ({ state, has_subs }) {
+      const { expanded_subs, expanded_hubs } = state
+      if (expanded_subs && expanded_hubs) return 'bottom-cross'
+      if (expanded_subs) return 'bottom-tee-down'
+      if (expanded_hubs) return has_subs ? 'bottom-tee-up' : 'bottom-light-tee-up'
+      return has_subs ? 'bottom-line' : 'bottom-light-line'
+    }
+
+    function get_middle_sub_prefix ({ state, has_subs }) {
+      const { expanded_subs, expanded_hubs } = state
+      if (expanded_subs && expanded_hubs) return 'middle-cross'
+      if (expanded_subs) return 'middle-tee-down'
+      if (expanded_hubs) return has_subs ? 'middle-tee-up' : 'middle-light-tee-up'
+      return has_subs ? 'middle-line' : 'middle-light-line'
+    }
+  }
+
+  /******************************************************************************
+  MENUBAR AND SEARCH
+  ******************************************************************************/
+  function render_menubar () {
+    const search_button = document.createElement('button')
+    search_button.textContent = 'Search'
+    search_button.onclick = toggle_search_mode
+
+    const undo_button = document.createElement('button')
+    undo_button.textContent = `Undo (${undo_stack.length})`
+    undo_button.onclick = () => undo(1)
+    undo_button.disabled = undo_stack.length === 0
+
+    const multi_select_button = document.createElement('button')
+    multi_select_button.textContent = `Multi Select: ${multi_select_enabled}`
+    multi_select_button.onclick = toggle_multi_select
+
+    const select_between_button = document.createElement('button')
+    select_between_button.textContent = `Select Between: ${select_between_enabled}`
+    select_between_button.onclick = toggle_select_between
+
+    const hubs_button = document.createElement('button')
+    hubs_button.textContent = `Hubs: ${hubs_flag}`
+    hubs_button.onclick = toggle_hubs_flag
+
+    const selection_button = document.createElement('button')
+    selection_button.textContent = `Selection: ${selection_flag}`
+    selection_button.onclick = toggle_selection_flag
+
+    const recursive_collapse_button = document.createElement('button')
+    recursive_collapse_button.textContent = `Recursive Collapse: ${recursive_collapse_flag}`
+    recursive_collapse_button.onclick = toggle_recursive_collapse_flag
+
+    menubar.replaceChildren(search_button, undo_button, multi_select_button, select_between_button, hubs_button, selection_button, recursive_collapse_button)
+  }
+
+  function render_searchbar () {
+    if (mode !== 'search') {
+      searchbar.style.display = 'none'
+      searchbar.replaceChildren()
+      return
+    }
+
+    const search_opts = {
+      type: 'text',
+      placeholder: 'Search entries...',
+      className: 'search-input',
+      value: search_query,
+      oninput: on_search_input
+    }
+    searchbar.style.display = 'flex'
+    const search_input = Object.assign(document.createElement('input'), search_opts)
+
+    searchbar.replaceChildren(search_input)
+    requestAnimationFrame(() => search_input.focus())
+  }
+
+  async function handle_mode_change () {
+    menubar.style.display = mode === 'default' ? 'none' : 'flex'
+    render_searchbar()
+    await build_and_render_view()
+  }
+
+  async function toggle_search_mode () {
+    const target_mode = mode === 'search' ? previous_mode : 'search'
+    console.log('[SEARCH DEBUG] Switching mode from', mode, 'to', target_mode)
+    send_message({ type: 'mode_toggling', data: { from: mode, to: target_mode } })
+    if (mode === 'search') {
+      // When switching from search to default mode, expand selected entries
+      if (selected_instance_paths.length > 0) {
+        console.log('[SEARCH DEBUG] Expanding selected entries in default mode:', selected_instance_paths)
+        await expand_selected_entries_in_default(selected_instance_paths)
+        drive_updated_by_toggle = true
+        update_drive_state({ type: 'runtime/instance_states', message: instance_states })
+      }
+      // Reset select-between mode when leaving search mode
+      if (select_between_enabled) {
+        select_between_enabled = false
+        select_between_first_node = null
+        update_drive_state({ type: 'mode/select_between_enabled', message: false })
+        console.log('[SEARCH DEBUG] Reset select-between mode when leaving search')
+      }
+      search_query = ''
+      update_drive_state({ type: 'mode/search_query', message: '' })
+    }
+    ignore_drive_updated_by_scroll = true
+    update_drive_state({ type: 'mode/current_mode', message: target_mode })
+    search_state_instances = instance_states
+    send_message({ type: 'mode_changed', data: { mode: target_mode } })
+  }
+
+  function toggle_multi_select () {
+    multi_select_enabled = !multi_select_enabled
+    // Disable select between when enabling multi select
+    if (multi_select_enabled && select_between_enabled) {
+      select_between_enabled = false
+      select_between_first_node = null
+      update_drive_state({ type: 'mode/select_between_enabled', message: false })
+    }
+    update_drive_state({ type: 'mode/multi_select_enabled', message: multi_select_enabled })
+    render_menubar() // Re-render to update button text
+  }
+
+  function toggle_select_between () {
+    select_between_enabled = !select_between_enabled
+    select_between_first_node = null // Reset first node selection
+    // Disable multi select when enabling select between
+    if (select_between_enabled && multi_select_enabled) {
+      multi_select_enabled = false
+      update_drive_state({ type: 'mode/multi_select_enabled', message: false })
+    }
+    update_drive_state({ type: 'mode/select_between_enabled', message: select_between_enabled })
+    render_menubar() // Re-render to update button text
+  }
+
+  function toggle_hubs_flag () {
+    const values = ['default', 'true', 'false']
+    const current_index = values.indexOf(hubs_flag)
+    const next_index = (current_index + 1) % values.length
+    hubs_flag = values[next_index]
+    update_drive_state({ type: 'flags/hubs', message: hubs_flag })
+    render_menubar()
+  }
+
+  function toggle_selection_flag () {
+    selection_flag = !selection_flag
+    update_drive_state({ type: 'flags/selection', message: selection_flag })
+    render_menubar()
+  }
+
+  function toggle_recursive_collapse_flag () {
+    recursive_collapse_flag = !recursive_collapse_flag
+    update_drive_state({ type: 'flags/recursive_collapse', message: recursive_collapse_flag })
+    render_menubar()
+  }
+
+  function on_search_input (event) {
+    search_query = event.target.value.trim()
+    drive_updated_by_search = true
+    update_drive_state({ type: 'mode/search_query', message: search_query })
+    if (search_query === '') search_state_instances = instance_states
+    perform_search(search_query)
+  }
+
+  async function perform_search (query) {
+    console.log('[SEARCH DEBUG] perform_search called:', {
+      query,
+      current_mode: mode,
+      search_query_var: search_query,
+      has_search_entry_states: Object.keys(search_entry_states).length > 0,
+      last_clicked_node
+    })
+    if (!query) {
+      console.log('[SEARCH DEBUG] No query provided, building default view')
+      return build_and_render_view()
+    }
+
+    const original_view = await build_view_recursive({
+      base_path: '/',
+      parent_instance_path: '',
+      depth: 0,
+      is_last_sub: true,
+      is_hub: false,
+      parent_pipe_trail: [],
+      instance_states,
+      db
+    })
+    const original_view_paths = original_view.map(n => n.instance_path)
+    search_state_instances = {}
+    const search_tracking = {}
+    const search_view = await build_search_view_recursive({
+      query,
+      base_path: '/',
+      parent_instance_path: '',
+      depth: 0,
+      is_last_sub: true,
+      is_hub: false,
+      is_first_hub: false,
+      parent_pipe_trail: [],
+      instance_states: search_state_instances,
+      db,
+      original_view_paths,
+      is_expanded_child: false,
+      search_tracking
+    })
+    console.log('[SEARCH DEBUG] Search view built:', search_view.length)
+    render_search_results(search_view, query)
+  }
+
+  async function build_search_view_recursive ({
+    query,
+    base_path,
+    parent_instance_path,
+    parent_base_path = null,
+    depth,
+    is_last_sub,
+    is_hub,
+    is_first_hub = false,
+    parent_pipe_trail,
+    instance_states,
+    db,
+    original_view_paths,
+    is_expanded_child = false,
+    search_tracking = {}
+  }) {
+    const entry = await db.get(base_path)
+    if (!entry) return []
+
+    const instance_path = `${parent_instance_path}|${base_path}`
+    const is_direct_match = entry.name && entry.name.toLowerCase().includes(query.toLowerCase())
+
+    // track instance for duplicate detection
+    if (!search_tracking[base_path]) search_tracking[base_path] = []
+    const is_first_occurrence_in_search = !search_tracking[base_path].length
+    search_tracking[base_path].push(instance_path)
+
+    // Use extracted pipe logic for consistent rendering
+    const { children_pipe_trail, is_hub_on_top } = await calculate_children_pipe_trail({
+      depth,
+      is_hub,
+      is_last_sub,
+      is_first_hub,
+      parent_pipe_trail,
+      parent_base_path,
+      base_path,
+      db
+    })
+
+    // Process hubs if they should be expanded
+    const search_state = search_entry_states[instance_path]
+    const should_expand_hubs = search_state ? search_state.expanded_hubs : false
+    const should_expand_subs = search_state ? search_state.expanded_subs : false
+
+    // Process hubs: if manually expanded, show ALL hubs regardless of search match
+    const hub_results = []
+    if (should_expand_hubs && entry.hubs) {
+      for (let i = 0; i < entry.hubs.length; i++) {
+        const hub_path = entry.hubs[i]
+        const hub_view = await build_search_view_recursive({
+          query,
+          base_path: hub_path,
+          parent_instance_path: instance_path,
+          parent_base_path: base_path,
+          depth: depth + 1,
+          is_last_sub: i === entry.hubs.length - 1,
+          is_hub: true,
+          is_first_hub: is_hub_on_top,
+          parent_pipe_trail: children_pipe_trail,
+          instance_states,
+          db,
+          original_view_paths,
+          is_expanded_child: true,
+          search_tracking
+        })
+        hub_results.push(...hub_view)
+      }
+    }
+
+    // Handle subs: if manually expanded, show ALL children; otherwise, search through them
+    const sub_results = []
+    if (should_expand_subs) {
+      // Show ALL subs when manually expanded
+      if (entry.subs) {
+        for (let i = 0; i < entry.subs.length; i++) {
+          const sub_path = entry.subs[i]
+          const sub_view = await build_search_view_recursive({
+            query,
+            base_path: sub_path,
+            parent_instance_path: instance_path,
+            parent_base_path: base_path,
+            depth: depth + 1,
+            is_last_sub: i === entry.subs.length - 1,
+            is_hub: false,
+            is_first_hub: false,
+            parent_pipe_trail: children_pipe_trail,
+            instance_states,
+            db,
+            original_view_paths,
+            is_expanded_child: true,
+            search_tracking
+          })
+          sub_results.push(...sub_view)
+        }
+      }
+    } else if (!is_expanded_child && is_first_occurrence_in_search) {
+      // Only search through subs for the first occurrence of this base_path
+      if (entry.subs) {
+        for (let i = 0; i < entry.subs.length; i++) {
+          const sub_path = entry.subs[i]
+          const sub_view = await build_search_view_recursive({
+            query,
+            base_path: sub_path,
+            parent_instance_path: instance_path,
+            parent_base_path: base_path,
+            depth: depth + 1,
+            is_last_sub: i === entry.subs.length - 1,
+            is_hub: false,
+            is_first_hub: false,
+            parent_pipe_trail: children_pipe_trail,
+            instance_states,
+            db,
+            original_view_paths,
+            is_expanded_child: false,
+            search_tracking
+          })
+          sub_results.push(...sub_view)
+        }
+      }
+    }
+
+    const has_matching_descendant = sub_results.length > 0
+
+    // If this is an expanded child, always include it regardless of search match
+    // only include if it's the first occurrence OR if a dirct match
+    if (!is_expanded_child && !is_direct_match && !has_matching_descendant) return []
+    if (!is_expanded_child && !is_first_occurrence_in_search && !is_direct_match) return []
+
+    const final_expand_subs = search_state ? search_state.expanded_subs : (has_matching_descendant && is_first_occurrence_in_search)
+    const final_expand_hubs = search_state ? search_state.expanded_hubs : false
+
+    instance_states[instance_path] = { expanded_subs: final_expand_subs, expanded_hubs: final_expand_hubs }
+    const is_in_original_view = original_view_paths.includes(instance_path)
+
+    // Calculate pipe_trail for this search node
+    const { pipe_trail, is_hub_on_top: calculated_is_hub_on_top } = await calculate_pipe_trail({
+      depth,
+      is_hub,
+      is_last_sub,
+      is_first_hub,
+      is_hub_on_top,
+      parent_pipe_trail,
+      parent_base_path,
+      base_path,
+      db
+    })
+
+    const current_node_view = {
+      base_path,
+      instance_path,
+      depth,
+      is_last_sub,
+      is_hub,
+      is_first_hub,
+      parent_pipe_trail,
+      parent_base_path,
+      is_search_match: true,
+      is_direct_match,
+      is_in_original_view,
+      entry, // Include entry data
+      pipe_trail, // Pre-calculated pipe trail
+      is_hub_on_top: calculated_is_hub_on_top // Pre-calculated hub position
+    }
+
+    return [...hub_results, current_node_view, ...sub_results]
+  }
+
+  function render_search_results (search_view, query) {
+    view = search_view
+    if (search_view.length === 0) {
+      const no_results_el = document.createElement('div')
+      no_results_el.className = 'no-results'
+      no_results_el.textContent = `No results for "${query}"`
+      return container.replaceChildren(no_results_el)
+    }
+
+    // temporary tracking map for search results to detect duplicates
+    const search_tracking = {}
+    search_view.forEach(node => set_search_tracking(node))
+
+    const original_tracking = view_order_tracking
+    view_order_tracking = search_tracking
+    collect_all_duplicate_entries()
+
+    const fragment = document.createDocumentFragment()
+    search_view.forEach(node_data => fragment.appendChild(create_node({ ...node_data, query })))
+    container.replaceChildren(fragment)
+
+    view_order_tracking = original_tracking
+
+    function set_search_tracking (node) {
+      const { base_path, instance_path } = node
+      if (!search_tracking[base_path]) search_tracking[base_path] = []
+      search_tracking[base_path].push(instance_path)
+    }
+  }
+
+  /******************************************************************************
+  VIEW MANIPULATION & USER ACTIONS
+      - These functions handle user interactions like selecting, confirming,
+        toggling, and resetting the graph.
+  ******************************************************************************/
+  function select_node (ev, instance_path) {
+    last_clicked_node = instance_path
+    update_drive_state({ type: 'runtime/last_clicked_node', message: instance_path })
+    send_message({ type: 'node_clicked', data: { instance_path } })
+
+    // Handle shift+click to enable select between mode temporarily
+    if (ev.shiftKey && !select_between_enabled) {
+      select_between_enabled = true
+      select_between_first_node = null
+      update_drive_state({ type: 'mode/select_between_enabled', message: true })
+      render_menubar()
+    }
+
+    const new_selected = new Set(selected_instance_paths)
+
+    if (select_between_enabled) {
+      handle_select_between(instance_path, new_selected)
+    } else if (ev.ctrlKey || multi_select_enabled) {
+      new_selected.has(instance_path) ? new_selected.delete(instance_path) : new_selected.add(instance_path)
+      update_drive_state({ type: 'runtime/selected_instance_paths', message: [...new_selected] })
+      send_message({ type: 'selection_changed', data: { selected: [...new_selected] } })
+    } else {
+      update_drive_state({ type: 'runtime/selected_instance_paths', message: [instance_path] })
+      send_message({ type: 'selection_changed', data: { selected: [instance_path] } })
+    }
+  }
+
+  function handle_select_between (instance_path, new_selected) {
+    if (!select_between_first_node) {
+      select_between_first_node = instance_path
+    } else {
+      const first_index = view.findIndex(n => n.instance_path === select_between_first_node)
+      const second_index = view.findIndex(n => n.instance_path === instance_path)
+
+      if (first_index !== -1 && second_index !== -1) {
+        const start_index = Math.min(first_index, second_index)
+        const end_index = Math.max(first_index, second_index)
+
+        // Toggle selection for all nodes in the range
+        for (let i = start_index; i <= end_index; i++) {
+          const node_instance_path = view[i].instance_path
+          new_selected.has(node_instance_path) ? new_selected.delete(node_instance_path) : new_selected.add(node_instance_path)
+        }
+
+        update_drive_state({ type: 'runtime/selected_instance_paths', message: [...new_selected] })
+      }
+
+      // Reset select between mode after second click
+      select_between_enabled = false
+      select_between_first_node = null
+      update_drive_state({ type: 'mode/select_between_enabled', message: false })
+      render_menubar()
+    }
+  }
+
+  // Add the clicked entry and all its parents in the default tree
+  async function expand_entry_path_in_default (target_instance_path) {
+    console.log('[SEARCH DEBUG] search_expand_into_default called:', {
+      target_instance_path,
+      current_mode: mode,
+      search_query,
+      previous_mode,
+      current_search_entry_states: Object.keys(search_entry_states).length,
+      current_instance_states: Object.keys(instance_states).length
+    })
+
+    if (!target_instance_path) {
+      console.warn('[SEARCH DEBUG] No target_instance_path provided')
+      return
+    }
+
+    const parts = target_instance_path.split('|').filter(Boolean)
+    if (parts.length === 0) {
+      console.warn('[SEARCH DEBUG] No valid parts found in instance path:', target_instance_path)
+      return
+    }
+
+    console.log('[SEARCH DEBUG] Parsed instance path parts:', parts)
+
+    const root_state = get_or_create_state(instance_states, '|/')
+    root_state.expanded_subs = true
+
+    // Walk from root to target, expanding the path relative to already expanded entries
+    for (let i = 0; i < parts.length - 1; i++) {
+      const parent_base = parts[i]
+      const child_base = parts[i + 1]
+      const parent_instance_path = parts.slice(0, i + 1).map(p => '|' + p).join('')
+      const parent_state = get_or_create_state(instance_states, parent_instance_path)
+      const parent_entry = await db.get(parent_base)
+
+      console.log('[SEARCH DEBUG] Processing parent-child relationship:', {
+        parent_base,
+        child_base,
+        parent_instance_path,
+        has_parent_entry: !!parent_entry
+      })
+
+      if (!parent_entry) continue
+      if (Array.isArray(parent_entry.subs) && parent_entry.subs.includes(child_base)) {
+        parent_state.expanded_subs = true
+        console.log('[SEARCH DEBUG] Expanded subs for:', parent_instance_path)
+      }
+      if (Array.isArray(parent_entry.hubs) && parent_entry.hubs.includes(child_base)) {
+        parent_state.expanded_hubs = true
+        console.log('[SEARCH DEBUG] Expanded hubs for:', parent_instance_path)
+      }
+    }
+  }
+
+  // expand multiple selected entry in the default tree
+  async function expand_selected_entries_in_default (selected_paths) {
+    console.log('[SEARCH DEBUG] expand_selected_entries_in_default called:', {
+      selected_paths,
+      current_mode: mode,
+      search_query,
+      previous_mode
+    })
+
+    if (!Array.isArray(selected_paths) || selected_paths.length === 0) {
+      console.warn('[SEARCH DEBUG] No valid selected paths provided')
+      return
+    }
+
+    // expand foreach selected path
+    for (const path of selected_paths) {
+      await expand_entry_path_in_default(path)
+    }
+
+    console.log('[SEARCH DEBUG] All selected entries expanded in default mode')
+  }
+
+  // Add the clicked entry and all its parents in the default tree
+  async function search_expand_into_default (target_instance_path) {
+    if (!target_instance_path) {
+      return
+    }
+
+    handle_search_node_click(target_instance_path)
+    await expand_entry_path_in_default(target_instance_path)
+
+    console.log('[SEARCH DEBUG] Current mode before switch:', mode)
+    console.log('[SEARCH DEBUG] Target previous_mode:', previous_mode)
+
+    // Persist selection and expansion state
+    update_drive_state({ type: 'runtime/selected_instance_paths', message: [target_instance_path] })
+    drive_updated_by_toggle = true
+    update_drive_state({ type: 'runtime/instance_states', message: instance_states })
+    search_query = ''
+    update_drive_state({ type: 'mode/search_query', message: '' })
+
+    console.log('[SEARCH DEBUG] About to switch from search mode to:', previous_mode)
+    update_drive_state({ type: 'mode/current_mode', message: previous_mode })
+  }
+
+  function handle_confirm (ev, instance_path) {
+    if (!ev.target) return
+    const is_checked = ev.target.checked
+    const new_selected = new Set(selected_instance_paths)
+    const new_confirmed = new Set(confirmed_instance_paths)
+
+    // use specific logic for mode
+    if (mode === 'search') {
+      handle_search_node_click(instance_path)
+    } else {
+      last_clicked_node = instance_path
+      update_drive_state({ type: 'runtime/last_clicked_node', message: instance_path })
+    }
+
+    if (is_checked) {
+      new_selected.delete(instance_path)
+      new_confirmed.add(instance_path)
+    } else {
+      new_selected.add(instance_path)
+      new_confirmed.delete(instance_path)
+    }
+
+    update_drive_state({ type: 'runtime/selected_instance_paths', message: [...new_selected] })
+    update_drive_state({ type: 'runtime/confirmed_selected', message: [...new_confirmed] })
+  }
+
+  async function toggle_subs (instance_path) {
+    const state = get_or_create_state(instance_states, instance_path)
+    const was_expanded = state.expanded_subs
+    state.expanded_subs = !state.expanded_subs
+
+    // Update view order tracking for the toggled subs
+    const base_path = instance_path.split('|').pop()
+    const entry = await db.get(base_path)
+
+    if (entry && Array.isArray(entry.subs)) {
+      if (was_expanded && recursive_collapse_flag === true) {
+        for (const sub_path of entry.subs) {
+          await collapse_and_remove_instance(sub_path, instance_path, instance_states, db)
+        }
+      } else {
+        for (const sub_path of entry.subs) {
+          await toggle_subs_instance(sub_path, instance_path, instance_states, db)
+        }
+      }
+    }
+
+    last_clicked_node = instance_path
+    update_drive_state({ type: 'runtime/last_clicked_node', message: instance_path })
+
+    build_and_render_view(instance_path)
+    // Set a flag to prevent the subsequent `onbatch` call from causing a render loop.
+    drive_updated_by_toggle = true
+    update_drive_state({ type: 'runtime/instance_states', message: instance_states })
+    send_message({ type: 'subs_toggled', data: { instance_path, expanded: state.expanded_subs } })
+
+    async function toggle_subs_instance (sub_path, instance_path, instance_states, db) {
+      if (was_expanded) {
+        // Collapsing so
+        await remove_instances_recursively(sub_path, instance_path, instance_states, db)
+      } else {
+        // Expanding so
+        await add_instances_recursively(sub_path, instance_path, instance_states, db)
+      }
+    }
+
+    async function collapse_and_remove_instance (sub_path, instance_path, instance_states, db) {
+      await collapse_subs_recursively(sub_path, instance_path, instance_states, db)
+      await remove_instances_recursively(sub_path, instance_path, instance_states, db)
+    }
+  }
+
+  async function toggle_hubs (instance_path) {
+    const state = get_or_create_state(instance_states, instance_path)
+    const was_expanded = state.expanded_hubs
+    state.expanded_hubs ? hub_num-- : hub_num++
+    state.expanded_hubs = !state.expanded_hubs
+
+    // Update view order tracking for the toggled hubs
+    const base_path = instance_path.split('|').pop()
+    const entry = await db.get(base_path)
+
+    if (entry && Array.isArray(entry.hubs)) {
+      if (was_expanded && recursive_collapse_flag === true) {
+        // collapse all hub descendants
+        for (const hub_path of entry.hubs) {
+          await collapse_and_remove_instance(hub_path, instance_path, instance_states, db)
+        }
+      } else {
+        // only toggle direct hubs
+        for (const hub_path of entry.hubs) {
+          await toggle_hubs_instance(hub_path, instance_path, instance_states, db)
+        }
+      }
+
+      async function collapse_and_remove_instance (hub_path, instance_path, instance_states, db) {
+        await collapse_hubs_recursively(hub_path, instance_path, instance_states, db)
+        await remove_instances_recursively(hub_path, instance_path, instance_states, db)
+      }
+    }
+
+    last_clicked_node = instance_path
+    drive_updated_by_scroll = true // Prevent onbatch interference with hub spacer
+    update_drive_state({ type: 'runtime/last_clicked_node', message: instance_path })
+
+    build_and_render_view(instance_path, true)
+    drive_updated_by_toggle = true
+    update_drive_state({ type: 'runtime/instance_states', message: instance_states })
+    send_message({ type: 'hubs_toggled', data: { instance_path, expanded: state.expanded_hubs } })
+
+    async function toggle_hubs_instance (hub_path, instance_path, instance_states, db) {
+      if (was_expanded) {
+        // Collapsing so
+        await remove_instances_recursively(hub_path, instance_path, instance_states, db)
+      } else {
+        // Expanding so
+        await add_instances_recursively(hub_path, instance_path, instance_states, db)
+      }
+    }
+  }
+
+  async function toggle_search_subs (instance_path) {
+    console.log('[SEARCH DEBUG] toggle_search_subs called:', {
+      instance_path,
+      mode,
+      search_query,
+      current_state: search_entry_states[instance_path]?.expanded_subs || false,
+      recursive_collapse_flag
+    })
+
+    const state = get_or_create_state(search_entry_states, instance_path)
+    const old_expanded = state.expanded_subs
+    state.expanded_subs = !state.expanded_subs
+
+    if (old_expanded && recursive_collapse_flag === true) {
+      const base_path = instance_path.split('|').pop()
+      const entry = await db.get(base_path)
+      if (entry && Array.isArray(entry.subs)) entry.subs.forEach(sub_path => collapse_search_subs_recursively(sub_path, instance_path, search_entry_states, db))
+    }
+
+    const has_matching_descendant = search_state_instances[instance_path]?.expanded_subs ? null : true
+    const has_matching_parents = manipulated_inside_search[instance_path] ? search_entry_states[instance_path]?.expanded_hubs : search_state_instances[instance_path]?.expanded_hubs
+    manipulated_inside_search[instance_path] = { expanded_hubs: has_matching_parents, expanded_subs: has_matching_descendant }
+    console.log('[SEARCH DEBUG] Toggled subs state:', {
+      instance_path,
+      old_expanded,
+      new_expanded: state.expanded_subs,
+      recursive_state: old_expanded && recursive_collapse_flag === true
+    })
+
+    handle_search_node_click(instance_path)
+
+    perform_search(search_query)
+    drive_updated_by_search = true
+    update_drive_state({ type: 'runtime/search_entry_states', message: search_entry_states })
+  }
+
+  async function toggle_search_hubs (instance_path) {
+    console.log('[SEARCH DEBUG] toggle_search_hubs called:', {
+      instance_path,
+      mode,
+      search_query,
+      current_state: search_entry_states[instance_path]?.expanded_hubs || false,
+      recursive_collapse_flag
+    })
+
+    const state = get_or_create_state(search_entry_states, instance_path)
+    const old_expanded = state.expanded_hubs
+    state.expanded_hubs = !state.expanded_hubs
+
+    if (old_expanded && recursive_collapse_flag === true) {
+      const base_path = instance_path.split('|').pop()
+      const entry = await db.get(base_path)
+      if (entry && Array.isArray(entry.hubs)) entry.hubs.forEach(hub_path => collapse_search_hubs_recursively(hub_path, instance_path, search_entry_states, db))
+    }
+
+    const has_matching_descendant = search_state_instances[instance_path]?.expanded_subs
+    manipulated_inside_search[instance_path] = { expanded_hubs: state.expanded_hubs, expanded_subs: has_matching_descendant }
+    console.log('[SEARCH DEBUG] Toggled hubs state:', {
+      instance_path,
+      old_expanded,
+      new_expanded: state.expanded_hubs,
+      recursive_state: old_expanded && recursive_collapse_flag === true
+    })
+
+    handle_search_node_click(instance_path)
+
+    console.log('[SEARCH DEBUG] About to perform_search after toggle_search_hubs')
+    perform_search(search_query)
+    drive_updated_by_search = true
+    update_drive_state({ type: 'runtime/search_entry_states', message: search_entry_states })
+    console.log('[SEARCH DEBUG] toggle_search_hubs completed')
+  }
+
+  function handle_search_node_click (instance_path) {
+    console.log('[SEARCH DEBUG] handle_search_node_click called:', {
+      instance_path,
+      current_mode: mode,
+      search_query,
+      previous_last_clicked: last_clicked_node
+    })
+
+    if (mode !== 'search') {
+      console.warn('[SEARCH DEBUG] handle_search_node_click called but not in search mode!', {
+        current_mode: mode,
+        instance_path
+      })
+      return
+    }
+
+    // we need to handle last_clicked_node differently
+    const old_last_clicked = last_clicked_node
+    last_clicked_node = instance_path
+
+    console.log('[SEARCH DEBUG] Updating last_clicked_node:', {
+      old_value: old_last_clicked,
+      new_value: last_clicked_node,
+      mode,
+      search_query
+    })
+
+    update_drive_state({ type: 'runtime/last_clicked_node', message: instance_path })
+
+    // Update visual styling for search mode nodes
+    update_search_last_clicked_styling(instance_path)
+  }
+
+  function update_search_last_clicked_styling (target_instance_path) {
+    console.log('[SEARCH DEBUG] update_search_last_clicked_styling called:', {
+      target_instance_path,
+      mode,
+      search_query
+    })
+
+    // Remove `last-clicked` class from all search result nodes
+    const search_nodes = container.querySelectorAll('.node.search-result')
+    console.log('[SEARCH DEBUG] Found search result nodes:', search_nodes.length)
+    search_nodes.forEach(node => remove_last_clicked_styling(node))
+
+    // Add last-clicked class to the target node if it exists in search results
+    const target_node = container.querySelector(`[data-instance_path="${target_instance_path}"].search-result`)
+    if (target_node) {
+      mode === 'search' ? target_node.classList.add('search-last-clicked') : target_node.classList.add('last-clicked')
+      console.log('[SEARCH DEBUG] Added last-clicked to target node:', target_instance_path)
+    } else {
+      console.warn('[SEARCH DEBUG] Target node not found in search results:', {
+        target_instance_path,
+        available_search_nodes: Array.from(search_nodes).map(n => n.dataset.instance_path)
+      })
+    }
+
+    function remove_last_clicked_styling (node) {
+      const was_last_clicked = node.classList.contains('last-clicked')
+      mode === 'search' ? node.classList.remove('search-last-clicked') : node.classList.remove('last-clicked')
+      if (was_last_clicked) {
+        console.log('[SEARCH DEBUG] Removed last-clicked from:', node.dataset.instance_path)
+      }
+    }
+  }
+
+  function handle_search_name_click (ev, instance_path) {
+    console.log('[SEARCH DEBUG] handle_search_name_click called:', {
+      instance_path,
+      mode,
+      search_query,
+      ctrlKey: ev.ctrlKey,
+      metaKey: ev.metaKey,
+      shiftKey: ev.shiftKey,
+      multi_select_enabled,
+      current_selected: selected_instance_paths.length
+    })
+
+    if (mode !== 'search') {
+      console.error('[SEARCH DEBUG] handle_search_name_click called but not in search mode!', {
+        current_mode: mode,
+        instance_path
+      })
+      return
+    }
+
+    handle_search_node_click(instance_path)
+
+    if (ev.ctrlKey || ev.metaKey || multi_select_enabled) {
+      search_select_node(ev, instance_path)
+    } else if (ev.shiftKey) {
+      search_select_node(ev, instance_path)
+    } else if (select_between_enabled) {
+      // Handle select-between mode when button is enabled
+      search_select_node(ev, instance_path)
+    } else {
+      // Regular click
+      search_expand_into_default(instance_path)
+    }
+  }
+
+  function search_select_node (ev, instance_path) {
+    console.log('[SEARCH DEBUG] search_select_node called:', {
+      instance_path,
+      mode,
+      search_query,
+      shiftKey: ev.shiftKey,
+      ctrlKey: ev.ctrlKey,
+      metaKey: ev.metaKey,
+      multi_select_enabled,
+      select_between_enabled,
+      select_between_first_node,
+      current_selected: selected_instance_paths
+    })
+
+    const new_selected = new Set(selected_instance_paths)
+
+    if (select_between_enabled) {
+      if (!select_between_first_node) {
+        select_between_first_node = instance_path
+        console.log('[SEARCH DEBUG] Set first node for select between:', instance_path)
+      } else {
+        console.log('[SEARCH DEBUG] Completing select between range:', {
+          first: select_between_first_node,
+          second: instance_path
+        })
+        const first_index = view.findIndex(n => n.instance_path === select_between_first_node)
+        const second_index = view.findIndex(n => n.instance_path === instance_path)
+
+        if (first_index !== -1 && second_index !== -1) {
+          const start_index = Math.min(first_index, second_index)
+          const end_index = Math.max(first_index, second_index)
+
+          // Toggle selection for all nodes in between
+          for (let i = start_index; i <= end_index; i++) {
+            const node_instance_path = view[i].instance_path
+            if (new_selected.has(node_instance_path)) {
+              new_selected.delete(node_instance_path)
+            } else {
+              new_selected.add(node_instance_path)
+            }
+          }
+        }
+
+        // Reset select between mode after completing the selection
+        select_between_enabled = false
+        select_between_first_node = null
+        update_drive_state({ type: 'mode/select_between_enabled', message: false })
+        render_menubar()
+        console.log('[SEARCH DEBUG] Reset select between mode')
+      }
+    } else if (ev.shiftKey) {
+      // Enable select between mode on shift click
+      select_between_enabled = true
+      select_between_first_node = instance_path
+      update_drive_state({ type: 'mode/select_between_enabled', message: true })
+      render_menubar()
+      console.log('[SEARCH DEBUG] Enabled select between mode with first node:', instance_path)
+      return
+    } else if (multi_select_enabled || ev.ctrlKey || ev.metaKey) {
+      if (new_selected.has(instance_path)) {
+        console.log('[SEARCH DEBUG] Deselecting node:', instance_path)
+        new_selected.delete(instance_path)
+      } else {
+        console.log('[SEARCH DEBUG] Selecting node:', instance_path)
+        new_selected.add(instance_path)
+      }
+    } else {
+      // Single selection mode
+      new_selected.clear()
+      new_selected.add(instance_path)
+      console.log('[SEARCH DEBUG] Single selecting node:', instance_path)
+    }
+
+    const new_selection_array = [...new_selected]
+    update_drive_state({ type: 'runtime/selected_instance_paths', message: new_selection_array })
+    console.log('[SEARCH DEBUG] search_select_node completed, new selection:', new_selection_array)
+  }
+
+  function reset () {
+    // reset all of the manual expansions made
+    instance_states = {}
+    view_order_tracking = {} // Clear view order tracking on reset
+    drive_updated_by_tracking = true
+    update_drive_state({ type: 'runtime/view_order_tracking', message: view_order_tracking })
+    if (mode === 'search') {
+      search_entry_states = {}
+      drive_updated_by_toggle = true
+      update_drive_state({ type: 'runtime/search_entry_states', message: search_entry_states })
+      perform_search(search_query)
+      return
+    }
+    const root_instance_path = '|/'
+    const new_instance_states = {
+      [root_instance_path]: { expanded_subs: true, expanded_hubs: false }
+    }
+    update_drive_state({ type: 'runtime/vertical_scroll_value', message: 0 })
+    update_drive_state({ type: 'runtime/horizontal_scroll_value', message: 0 })
+    update_drive_state({ type: 'runtime/selected_instance_paths', message: [] })
+    update_drive_state({ type: 'runtime/confirmed_selected', message: [] })
+    update_drive_state({ type: 'runtime/instance_states', message: new_instance_states })
+  }
+
+  /******************************************************************************
+  VIRTUAL SCROLLING
+    - These functions implement virtual scrolling to handle large graphs
+      efficiently using an IntersectionObserver.
+  ******************************************************************************/
+  function onscroll () {
+    if (scroll_update_pending) return
+    scroll_update_pending = true
+    requestAnimationFrame(scroll_frames)
+    function scroll_frames () {
+      const scroll_delta = vertical_scroll_value - container.scrollTop
+      // Handle removal of the scroll spacer.
+      if (spacer_element && scroll_delta > 0 && container.scrollTop === 0) {
+        spacer_element.remove()
+        spacer_element = null
+        spacer_initial_height = 0
+        hub_num = 0
+      }
+
+      vertical_scroll_value = update_scroll_state({ current_value: vertical_scroll_value, new_value: container.scrollTop, name: 'vertical_scroll_value' })
+      horizontal_scroll_value = update_scroll_state({ current_value: horizontal_scroll_value, new_value: container.scrollLeft, name: 'horizontal_scroll_value' })
+      scroll_update_pending = false
+    }
+  }
+
+  async function fill_viewport_downwards () {
+    if (is_rendering || end_index >= view.length) return
+    is_rendering = true
+    const container_rect = container.getBoundingClientRect()
+    let sentinel_rect = bottom_sentinel.getBoundingClientRect()
+    while (end_index < view.length && sentinel_rect.top < container_rect.bottom + 500) {
+      render_next_chunk()
+      await new Promise(resolve => requestAnimationFrame(resolve))
+      sentinel_rect = bottom_sentinel.getBoundingClientRect()
+    }
+    is_rendering = false
+  }
+
+  async function fill_viewport_upwards () {
+    if (is_rendering || start_index <= 0) return
+    is_rendering = true
+    const container_rect = container.getBoundingClientRect()
+    let sentinel_rect = top_sentinel.getBoundingClientRect()
+    while (start_index > 0 && sentinel_rect.bottom > container_rect.top - 500) {
+      render_prev_chunk()
+      await new Promise(resolve => requestAnimationFrame(resolve))
+      sentinel_rect = top_sentinel.getBoundingClientRect()
+    }
+    is_rendering = false
+  }
+
+  function handle_sentinel_intersection (entries) {
+    entries.forEach(entry => fill_downwards_or_upwards(entry))
+  }
+
+  function fill_downwards_or_upwards (entry) {
+    if (entry.isIntersecting) {
+      if (entry.target === top_sentinel) fill_viewport_upwards()
+      else if (entry.target === bottom_sentinel) fill_viewport_downwards()
+    }
+  }
+
+  function render_next_chunk () {
+    if (end_index >= view.length) return
+    const fragment = document.createDocumentFragment()
+    const next_end = Math.min(view.length, end_index + chunk_size)
+    for (let i = end_index; i < next_end; i++) { if (view[i]) fragment.appendChild(create_node(view[i])) }
+    container.insertBefore(fragment, bottom_sentinel)
+    end_index = next_end
+    bottom_sentinel.style.height = `${(view.length - end_index) * node_height}px`
+    cleanup_dom(false)
+  }
+
+  function render_prev_chunk () {
+    if (start_index <= 0) return
+    const fragment = document.createDocumentFragment()
+    const prev_start = Math.max(0, start_index - chunk_size)
+    for (let i = prev_start; i < start_index; i++) {
+      if (view[i]) fragment.appendChild(create_node(view[i]))
+    }
+    container.insertBefore(fragment, top_sentinel.nextSibling)
+    start_index = prev_start
+    top_sentinel.style.height = `${start_index * node_height}px`
+    cleanup_dom(true)
+  }
+
+  // Removes nodes from the DOM that are far outside the viewport.
+  function cleanup_dom (is_scrolling_up) {
+    const rendered_count = end_index - start_index
+    if (rendered_count <= max_rendered_nodes) return
+
+    const to_remove_count = rendered_count - max_rendered_nodes
+    if (is_scrolling_up) {
+      // If scrolling up, remove nodes from the bottom.
+      remove_dom_nodes({ count: to_remove_count, start_el: bottom_sentinel, next_prop: 'previousElementSibling', boundary_el: top_sentinel })
+      end_index -= to_remove_count
+      bottom_sentinel.style.height = `${(view.length - end_index) * node_height}px`
+    } else {
+      // If scrolling down, remove nodes from the top.
+      remove_dom_nodes({ count: to_remove_count, start_el: top_sentinel, next_prop: 'nextElementSibling', boundary_el: bottom_sentinel })
+      start_index += to_remove_count
+      top_sentinel.style.height = `${start_index * node_height}px`
+    }
+  }
+
+  /******************************************************************************
+  ENTRY DUPLICATION PREVENTION
+  ******************************************************************************/
+
+  function collect_all_duplicate_entries () {
+    duplicate_entries_map = {}
+    // Use view_order_tracking for duplicate detection
+    for (const [base_path, instance_paths] of Object.entries(view_order_tracking)) {
+      if (instance_paths.length > 1) {
+        duplicate_entries_map[base_path] = {
+          instances: instance_paths,
+          first_instance: instance_paths[0] // First occurrence in view order
+        }
+      }
+    }
+  }
+
+  async function initialize_tracking_from_current_state () {
+    const root_path = '/'
+    const root_instance_path = '|/'
+    if (await db.has(root_path)) {
+      add_instance_to_view_tracking(root_path, root_instance_path)
+      // Add initially expanded subs if any
+      const root_entry = await db.get(root_path)
+      if (root_entry && Array.isArray(root_entry.subs)) {
+        for (const sub_path of root_entry.subs) {
+          await add_instances_recursively(sub_path, root_instance_path, instance_states, db)
+        }
+      }
+    }
+  }
+
+  function add_instance_to_view_tracking (base_path, instance_path) {
+    if (!view_order_tracking[base_path]) view_order_tracking[base_path] = []
+    if (!view_order_tracking[base_path].includes(instance_path)) {
+      view_order_tracking[base_path].push(instance_path)
+
+      // Only save to drive if not currently loading from drive
+      if (!is_loading_from_drive) {
+        drive_updated_by_tracking = true
+        update_drive_state({ type: 'runtime/view_order_tracking', message: view_order_tracking })
+      }
+    }
+  }
+
+  function remove_instance_from_view_tracking (base_path, instance_path) {
+    if (view_order_tracking[base_path]) {
+      const index = view_order_tracking[base_path].indexOf(instance_path)
+      if (index !== -1) {
+        view_order_tracking[base_path].splice(index, 1)
+        // Clean up empty arrays
+        if (view_order_tracking[base_path].length === 0) {
+          delete view_order_tracking[base_path]
+        }
+
+        // Only save to drive if not currently loading from drive
+        if (!is_loading_from_drive) {
+          drive_updated_by_tracking = true
+          update_drive_state({ type: 'runtime/view_order_tracking', message: view_order_tracking })
+        }
+      }
+    }
+  }
+
+  // Recursively add instances to tracking when expanding
+  async function add_instances_recursively (base_path, parent_instance_path, instance_states, db) {
+    const instance_path = `${parent_instance_path}|${base_path}`
+    const entry = await db.get(base_path)
+    if (!entry) return
+
+    const state = get_or_create_state(instance_states, instance_path)
+
+    if (state.expanded_hubs && Array.isArray(entry.hubs)) {
+      for (const hub_path of entry.hubs) {
+        await add_instances_recursively(hub_path, instance_path, instance_states, db)
+      }
+    }
+
+    if (state.expanded_subs && Array.isArray(entry.subs)) {
+      for (const sub_path of entry.subs) {
+        await add_instances_recursively(sub_path, instance_path, instance_states, db)
+      }
+    }
+
+    // Add the instance itself
+    add_instance_to_view_tracking(base_path, instance_path)
+  }
+
+  // Recursively remove instances from tracking when collapsing
+  async function remove_instances_recursively (base_path, parent_instance_path, instance_states, db) {
+    const instance_path = `${parent_instance_path}|${base_path}`
+    const entry = await db.get(base_path)
+    if (!entry) return
+
+    const state = get_or_create_state(instance_states, instance_path)
+
+    if (state.expanded_hubs && Array.isArray(entry.hubs)) {
+      for (const hub_path of entry.hubs) {
+        await remove_instances_recursively(hub_path, instance_path, instance_states, db)
+      }
+    }
+    if (state.expanded_subs && Array.isArray(entry.subs)) {
+      for (const sub_path of entry.subs) {
+        await remove_instances_recursively(sub_path, instance_path, instance_states, db)
+      }
+    }
+
+    // Remove the instance itself
+    remove_instance_from_view_tracking(base_path, instance_path)
+  }
+
+  // Recursively hubs all subs in default mode
+  async function collapse_subs_recursively (base_path, parent_instance_path, instance_states, db) {
+    const instance_path = `${parent_instance_path}|${base_path}`
+    const entry = await db.get(base_path)
+    if (!entry) return
+
+    const state = get_or_create_state(instance_states, instance_path)
+
+    if (state.expanded_subs && Array.isArray(entry.subs)) {
+      state.expanded_subs = false
+      for (const sub_path of entry.subs) {
+        await collapse_and_remove_instance(sub_path, instance_path, instance_states, db)
+      }
+    }
+
+    if (state.expanded_hubs && Array.isArray(entry.hubs)) {
+      state.expanded_hubs = false
+      hub_num = Math.max(0, hub_num - 1) // Decrement hub counter
+      for (const hub_path of entry.hubs) {
+        await collapse_and_remove_instance(hub_path, instance_path, instance_states, db)
+      }
+    }
+    async function collapse_and_remove_instance (base_path, instance_path, instance_states, db) {
+      await collapse_subs_recursively(base_path, instance_path, instance_states, db)
+      await remove_instances_recursively(base_path, instance_path, instance_states, db)
+    }
+  }
+
+  // Recursively hubs all hubs in default mode
+  async function collapse_hubs_recursively (base_path, parent_instance_path, instance_states, db) {
+    const instance_path = `${parent_instance_path}|${base_path}`
+    const entry = await db.get(base_path)
+    if (!entry) return
+
+    const state = get_or_create_state(instance_states, instance_path)
+
+    if (state.expanded_hubs && Array.isArray(entry.hubs)) {
+      state.expanded_hubs = false
+      hub_num = Math.max(0, hub_num - 1)
+      for (const hub_path of entry.hubs) {
+        await collapse_and_remove_instance(hub_path, instance_path, instance_states, db)
+      }
+    }
+
+    if (state.expanded_subs && Array.isArray(entry.subs)) {
+      state.expanded_subs = false
+      for (const sub_path of entry.subs) {
+        await collapse_and_remove_instance(sub_path, instance_path, instance_states, db)
+      }
+    }
+    async function collapse_and_remove_instance (base_path, instance_path, instance_states, db) {
+      await collapse_all_recursively(base_path, instance_path, instance_states, db)
+      await remove_instances_recursively(base_path, instance_path, instance_states, db)
+    }
+  }
+
+  // Recursively collapse in default mode
+  async function collapse_all_recursively (base_path, parent_instance_path, instance_states, db) {
+    const instance_path = `${parent_instance_path}|${base_path}`
+    const entry = await db.get(base_path)
+    if (!entry) return
+
+    const state = get_or_create_state(instance_states, instance_path)
+
+    if (state.expanded_subs && Array.isArray(entry.subs)) {
+      state.expanded_subs = false
+      for (const sub_path of entry.subs) {
+        await collapse_and_remove_instance_recursively(sub_path, instance_path, instance_states, db)
+      }
+    }
+
+    if (state.expanded_hubs && Array.isArray(entry.hubs)) {
+      state.expanded_hubs = false
+      hub_num = Math.max(0, hub_num - 1)
+      for (const hub_path of entry.hubs) {
+        await collapse_and_remove_instance_recursively(hub_path, instance_path, instance_states, db)
+      }
+    }
+
+    async function collapse_and_remove_instance_recursively (base_path, instance_path, instance_states, db) {
+      await collapse_all_recursively(base_path, instance_path, instance_states, db)
+      await remove_instances_recursively(base_path, instance_path, instance_states, db)
+    }
+  }
+
+  // Recursively subs all hubs in search mode
+  async function collapse_search_subs_recursively (base_path, parent_instance_path, search_entry_states, db) {
+    const instance_path = `${parent_instance_path}|${base_path}`
+    const entry = await db.get(base_path)
+    if (!entry) return
+
+    const state = get_or_create_state(search_entry_states, instance_path)
+
+    if (state.expanded_subs && Array.isArray(entry.subs)) {
+      state.expanded_subs = false
+      for (const sub_path of entry.subs) {
+        await collapse_search_all_recursively(sub_path, instance_path, search_entry_states, db)
+      }
+    }
+
+    if (state.expanded_hubs && Array.isArray(entry.hubs)) {
+      state.expanded_hubs = false
+      for (const hub_path of entry.hubs) {
+        await collapse_search_all_recursively(hub_path, instance_path, search_entry_states, db)
+      }
+    }
+  }
+
+  // Recursively hubs all hubs in search mode
+  async function collapse_search_hubs_recursively (base_path, parent_instance_path, search_entry_states, db) {
+    const instance_path = `${parent_instance_path}|${base_path}`
+    const entry = await db.get(base_path)
+    if (!entry) return
+
+    const state = get_or_create_state(search_entry_states, instance_path)
+
+    if (state.expanded_hubs && Array.isArray(entry.hubs)) {
+      state.expanded_hubs = false
+      for (const hub_path of entry.hubs) {
+        await collapse_search_all_recursively(hub_path, instance_path, search_entry_states, db)
+      }
+    }
+
+    if (state.expanded_subs && Array.isArray(entry.subs)) {
+      state.expanded_subs = false
+      for (const sub_path of entry.subs) {
+        await collapse_search_all_recursively(sub_path, instance_path, search_entry_states, db)
+      }
+    }
+  }
+
+  // Recursively collapse in search mode
+  async function collapse_search_all_recursively (base_path, parent_instance_path, search_entry_states, db) {
+    const instance_path = `${parent_instance_path}|${base_path}`
+    const entry = await db.get(base_path)
+    if (!entry) return
+
+    const state = get_or_create_state(search_entry_states, instance_path)
+
+    if (state.expanded_subs && Array.isArray(entry.subs)) {
+      state.expanded_subs = false
+      for (const sub_path of entry.subs) {
+        await collapse_search_all_recursively(sub_path, instance_path, search_entry_states, db)
+      }
+    }
+
+    if (state.expanded_hubs && Array.isArray(entry.hubs)) {
+      state.expanded_hubs = false
+      for (const hub_path of entry.hubs) {
+        await collapse_search_all_recursively(hub_path, instance_path, search_entry_states, db)
+      }
+    }
+  }
+
+  function get_next_duplicate_instance (base_path, current_instance_path) {
+    const duplicates = duplicate_entries_map[base_path]
+    if (!duplicates || duplicates.instances.length <= 1) return null
+
+    const current_index = duplicates.instances.indexOf(current_instance_path)
+    if (current_index === -1) return duplicates.instances[0]
+
+    const next_index = (current_index + 1) % duplicates.instances.length
+    return duplicates.instances[next_index]
+  }
+
+  function has_duplicates (base_path) {
+    return duplicate_entries_map[base_path] && duplicate_entries_map[base_path].instances.length > 1
+  }
+
+  function is_first_duplicate (base_path, instance_path) {
+    const duplicates = duplicate_entries_map[base_path]
+    return duplicates && duplicates.first_instance === instance_path
+  }
+
+  function cycle_to_next_duplicate (base_path, current_instance_path) {
+    const next_instance_path = get_next_duplicate_instance(base_path, current_instance_path)
+    if (next_instance_path) {
+      remove_jump_button_from_entry(current_instance_path)
+
+      // First, handle the scroll and DOM updates without drive state changes
+      scroll_to_and_highlight_instance(next_instance_path, current_instance_path)
+
+      // Manually update DOM styling
+      update_last_clicked_styling(next_instance_path)
+      last_clicked_node = next_instance_path
+      drive_updated_by_scroll = true // Prevent onbatch from interfering with scroll
+      drive_updated_by_match = true
+      update_drive_state({ type: 'runtime/last_clicked_node', message: next_instance_path })
+
+      // Add jump button to the target entry (with a small delay to ensure DOM is ready)
+      setTimeout(jump_out, 10)
+      function jump_out () {
+        const target_element = shadow.querySelector(`[data-instance_path="${CSS.escape(next_instance_path)}"]`)
+        if (target_element) {
+          add_jump_button_to_matching_entry(target_element, base_path, next_instance_path)
+        }
+      }
+    }
+  }
+
+  function update_last_clicked_styling (new_instance_path) {
+    // Remove last-clicked class from all elements
+    const all_nodes = mode === 'search' ? shadow.querySelectorAll('.node.search-last-clicked') : shadow.querySelectorAll('.node.last-clicked')
+    console.log('Removing last-clicked class from all nodes', all_nodes)
+    all_nodes.forEach(node => (mode === 'search' ? node.classList.remove('search-last-clicked') : node.classList.remove('last-clicked')))
+    // Add last-clicked class to the new element
+    if (new_instance_path) {
+      const new_element = shadow.querySelector(`[data-instance_path="${CSS.escape(new_instance_path)}"]`)
+      if (new_element) {
+        mode === 'search' ? new_element.classList.add('search-last-clicked') : new_element.classList.add('last-clicked')
+      }
+    }
+  }
+
+  function remove_jump_button_from_entry (instance_path) {
+    const current_element = shadow.querySelector(`[data-instance_path="${CSS.escape(instance_path)}"]`)
+    if (current_element) {
+      // restore the wand icon
+      const node_data = view.find(n => n.instance_path === instance_path)
+      if (node_data && node_data.base_path === '/' && instance_path === '|/') {
+        const wand_el = current_element.querySelector('.wand.navigate-to-hub')
+        if (wand_el && root_wand_state) {
+          wand_el.textContent = root_wand_state.content
+          wand_el.className = root_wand_state.className
+          wand_el.onclick = root_wand_state.onclick
+
+          root_wand_state = null
+        }
+        return
+      }
+
+      // Regular behavior for non-root nodes
+      const button_container = current_element.querySelector('.indent-btn-container')
+      if (button_container) {
+        button_container.remove()
+        // Restore left-indent class
+        if (node_data && node_data.depth > 0) {
+          current_element.classList.add('left-indent')
+        }
+      }
+    }
+  }
+
+  function add_jump_button_to_matching_entry (el, base_path, instance_path) {
+    // Check if jump button already exists
+    if (el.querySelector('.navigate-to-hub')) return
+
+    // replace the wand icon temporarily
+    if (base_path === '/' && instance_path === '|/') {
+      const wand_el = el.querySelector('.wand')
+      if (wand_el) {
+        // Store original wand state in JavaScript variable
+        root_wand_state = {
+          content: wand_el.textContent,
+          className: wand_el.className,
+          onclick: wand_el.onclick
+        }
+
+        // Replace with jump button
+        wand_el.textContent = '^'
+        wand_el.className = 'wand navigate-to-hub clickable'
+        wand_el.onclick = (ev) => handle_jump_button_click(ev, instance_path)
+      }
+      return
+
+      function handle_jump_button_click (ev, instance_path) {
+        ev.stopPropagation()
+        last_clicked_node = instance_path
+        drive_updated_by_match = true
+        update_drive_state({ type: 'runtime/last_clicked_node', message: instance_path })
+
+        update_last_clicked_styling(instance_path)
+
+        cycle_to_next_duplicate(base_path, instance_path)
+      }
+    }
+
+    const indent_button_div = document.createElement('div')
+    indent_button_div.className = 'indent-btn-container'
+
+    const navigate_button = document.createElement('span')
+    navigate_button.className = 'navigate-to-hub clickable'
+    navigate_button.textContent = '^'
+    navigate_button.onclick = (ev) => handle_navigate_button_click(ev, instance_path)
+
+    indent_button_div.appendChild(navigate_button)
+
+    // Remove left padding
+    el.classList.remove('left-indent')
+    el.insertBefore(indent_button_div, el.firstChild)
+
+    function handle_navigate_button_click (ev, instance_path) {
+      ev.stopPropagation() // Prevent triggering the whole entry click again
+      // Manually update last clicked node for jump button
+      last_clicked_node = instance_path
+      drive_updated_by_match = true
+      update_drive_state({ type: 'runtime/last_clicked_node', message: instance_path })
+
+      // Manually update DOM classes for last-clicked styling
+      update_last_clicked_styling(instance_path)
+
+      cycle_to_next_duplicate(base_path, instance_path)
+    }
+  }
+
+  function scroll_to_and_highlight_instance (target_instance_path, source_instance_path = null) {
+    const target_index = view.findIndex(n => n.instance_path === target_instance_path)
+    if (target_index === -1) return
+
+    // Calculate scroll position
+    let target_scroll_top = target_index * node_height
+
+    if (source_instance_path) {
+      const source_index = view.findIndex(n => n.instance_path === source_instance_path)
+      if (source_index !== -1) {
+        const source_scroll_top = source_index * node_height
+        const current_scroll_top = container.scrollTop
+        const source_visible_offset = source_scroll_top - current_scroll_top
+        target_scroll_top = target_scroll_top - source_visible_offset
+      }
+    }
+
+    container.scrollTop = target_scroll_top
+  }
+
+  /******************************************************************************
+  HELPER FUNCTIONS
+  ******************************************************************************/
+  function get_highlighted_name (name, query) {
+  // Creates a new regular expression.
+  // `escape_regex(query)` sanitizes the query string to treat special regex characters literally.
+  // `(...)` creates a capturing group for the escaped query.
+  // 'gi' flags: 'g' for global (all occurrences), 'i' for case-insensitive.
+    const regex = new RegExp(`(${escape_regex(query)})`, 'gi')
+    // Replaces all matches of the regex in 'name' with the matched text wrapped in search-match class.
+    // '$1' refers to the content of the first capturing group (the matched query).
+    return name.replace(regex, '<span class="search-match">$1</span>')
+  }
+
+  function escape_regex (string) {
+  // Escapes special regular expression characters in a string.
+  // It replaces characters like -, /, \, ^, $, *, +, ?, ., (, ), |, [, ], {, }
+  // with their escaped versions (e.g., '.' becomes '\.').
+  // This prevents them from being interpreted as regex metacharacters.
+    return string.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&') // Corrected: should be \\$& to escape the found char
+  }
+
+  function check_and_reset_feedback_flags () {
+    if (drive_updated_by_scroll && !ignore_drive_updated_by_scroll) {
+      drive_updated_by_scroll = false
+      return true
+    } else ignore_drive_updated_by_scroll = false
+    if (drive_updated_by_toggle) {
+      drive_updated_by_toggle = false
+      return true
+    }
+    if (drive_updated_by_search) {
+      drive_updated_by_search = false
+      return true
+    }
+    if (drive_updated_by_match) {
+      drive_updated_by_match = false
+      return true
+    }
+    if (drive_updated_by_tracking) {
+      drive_updated_by_tracking = false
+      return true
+    }
+    if (drive_updated_by_last_clicked) {
+      drive_updated_by_last_clicked = false
+      return true
+    }
+    if (drive_updated_by_undo) {
+      drive_updated_by_undo = false
+      return true
+    }
+    console.log('[SEARCH DEBUG] No feedback flags set, allowing onbatch')
+    return false
+  }
+
+  function parse_json_data (data, path) {
+    if (data === null) return null
+    try {
+      return typeof data === 'string' ? JSON.parse(data) : data
+    } catch (e) {
+      console.error(`Failed to parse JSON for ${path}:`, e)
+      return null
+    }
+  }
+
+  function process_path_array_update ({ current_paths, value, render_set, name }) {
+    const old_paths = [...current_paths]
+    const new_paths = Array.isArray(value)
+      ? value
+      : (console.warn(`${name} is not an array, defaulting to empty.`, value), [])
+    ;[...new Set([...old_paths, ...new_paths])].forEach(p => render_set.add(p))
+    return new_paths
+  }
+
+  function calculate_new_scroll_top ({ old_scroll_top, old_view, focal_path }) {
+    // Calculate the new scroll position to maintain the user's viewport.
+    if (focal_path) {
+      // If an action was focused on a specific node (like a toggle), try to keep it in the same position.
+      const old_idx = old_view.findIndex(n => n.instance_path === focal_path)
+      const new_idx = view.findIndex(n => n.instance_path === focal_path)
+      if (old_idx !== -1 && new_idx !== -1) {
+        return old_scroll_top + (new_idx - old_idx) * node_height
+      }
+    } else if (old_view.length > 0) {
+      // Otherwise, try to keep the topmost visible node in the same position.
+      const old_top_idx = Math.floor(old_scroll_top / node_height)
+      const old_top_node = old_view[old_top_idx]
+      if (old_top_node) {
+        const new_top_idx = view.findIndex(n => n.instance_path === old_top_node.instance_path)
+        if (new_top_idx !== -1) {
+          return new_top_idx * node_height + (old_scroll_top % node_height)
+        }
+      }
+    }
+    return old_scroll_top
+  }
+
+  function handle_spacer_element ({ hub_toggle, existing_height, new_scroll_top, sync_fn }) {
+    if (hub_toggle || hub_num > 0) {
+      spacer_element = document.createElement('div')
+      spacer_element.className = 'spacer'
+      container.appendChild(spacer_element)
+
+      if (hub_toggle) {
+        requestAnimationFrame(spacer_frames)
+      } else {
+        spacer_element.style.height = `${existing_height}px`
+        requestAnimationFrame(sync_fn)
+      }
+    } else {
+      spacer_element = null
+      spacer_initial_height = 0
+      requestAnimationFrame(sync_fn)
+    }
+    function spacer_frames () {
+      const container_height = container.clientHeight
+      const content_height = view.length * node_height
+      const max_scroll_top = content_height - container_height
+
+      if (new_scroll_top > max_scroll_top) {
+        spacer_initial_height = new_scroll_top - max_scroll_top
+        spacer_element.style.height = `${spacer_initial_height}px`
+      }
+      sync_fn()
+    }
+  }
+
+  function create_root_node ({ state, has_subs, instance_path }) {
+    // Handle the special case for the root node since its a bit different.
+    const el = document.createElement('div')
+    el.className = 'node type-root'
+    el.dataset.instance_path = instance_path
+    const prefix_class = has_subs || (mode === 'search' && search_query) ? 'prefix clickable' : 'prefix'
+    const prefix_name = state.expanded_subs ? 'tee-down' : 'line-h'
+    el.innerHTML = `<div class="wand clickable">🪄</div><span class="${prefix_class} ${prefix_name}"></span><span class="name ${(mode === 'search' && search_query) ? '' : 'clickable'}">/🌐</span>`
+
+    el.querySelector('.wand').onclick = reset
+    if (has_subs) {
+      const prefix_el = el.querySelector('.prefix')
+      if (prefix_el) {
+        prefix_el.onclick = (mode === 'search' && search_query) ? null : () => toggle_subs(instance_path)
+      }
+    }
+    el.querySelector('.name').onclick = ev => (mode === 'search' && search_query) ? null : select_node(ev, instance_path)
+    return el
+  }
+
+  function create_confirm_checkbox (instance_path) {
+    const checkbox_div = document.createElement('div')
+    checkbox_div.className = 'confirm-wrapper'
+    const is_confirmed = confirmed_instance_paths.includes(instance_path)
+    checkbox_div.innerHTML = `<input type="checkbox" ${is_confirmed ? 'checked' : ''}>`
+    const checkbox_input = checkbox_div.querySelector('input')
+    if (checkbox_input) checkbox_input.onchange = ev => handle_confirm(ev, instance_path)
+    return checkbox_div
+  }
+
+  function update_scroll_state ({ current_value, new_value, name }) {
+    if (current_value !== new_value) {
+      drive_updated_by_scroll = true // Set flag to prevent render loop.
+      update_drive_state({ type: `runtime/${name}`, message: new_value })
+      return new_value
+    }
+    return current_value
+  }
+
+  function remove_dom_nodes ({ count, start_el, next_prop, boundary_el }) {
+    for (let i = 0; i < count; i++) {
+      const temp = start_el[next_prop]
+      if (temp && temp !== boundary_el) temp.remove()
+      else break
+    }
+  }
+
+  /******************************************************************************
+  KEYBOARD NAVIGATION
+    - Handles keyboard-based navigation for the graph explorer
+    - Navigate up/down around last_clicked node
+  ******************************************************************************/
+  function handle_keyboard_navigation (event) {
+    // Don't handle keyboard events if focus is on input elements
+    if (event.target.tagName === 'INPUT' || event.target.tagName === 'TEXTAREA') {
+      return
+    }
+    const on_bind = {
+      navigate_up_current_node,
+      navigate_down_current_node,
+      toggle_subs_for_current_node,
+      toggle_hubs_for_current_node,
+      multiselect_current_node,
+      select_between_current_node,
+      toggle_search_mode,
+      jump_to_next_duplicate
+
+    }
+    let key_combination = ''
+    if (event.ctrlKey) key_combination += 'Control+'
+    if (event.altKey) key_combination += 'Alt+'
+    if (event.shiftKey) key_combination += 'Shift+'
+    key_combination += event.key
+
+    const action = keybinds[key_combination] || keybinds[event.key]
+    if (!action) return
+
+    // Prevent default behavior for handled keys
+    event.preventDefault()
+    const base_path = last_clicked_node.split('|').pop()
+    const current_instance_path = last_clicked_node
+    // Execute the appropriate action
+    on_bind[action]({ base_path, current_instance_path })
+  }
+  function navigate_up_current_node () {
+    navigate_to_adjacent_node(-1)
+  }
+  function navigate_down_current_node () {
+    navigate_to_adjacent_node(1)
+  }
+  function navigate_to_adjacent_node (direction) {
+    if (view.length === 0) return
+    if (!last_clicked_node) last_clicked_node = view[0].instance_path
+    const current_index = view.findIndex(node => node.instance_path === last_clicked_node)
+    if (current_index === -1) return
+
+    const new_index = current_index + direction
+    if (new_index < 0 || new_index >= view.length) return
+
+    const new_node = view[new_index]
+    last_clicked_node = new_node.instance_path
+    drive_updated_by_last_clicked = true
+    update_drive_state({ type: 'runtime/last_clicked_node', message: last_clicked_node })
+
+    // Update visual styling
+    if (mode === 'search' && search_query) {
+      update_search_last_clicked_styling(last_clicked_node)
+    } else {
+      update_last_clicked_styling(last_clicked_node)
+    }
+    const base_path = last_clicked_node.split('|').pop()
+    const has_duplicate_entries = has_duplicates(base_path)
+    const is_first_occurrence = is_first_duplicate(base_path, last_clicked_node)
+    if (has_duplicate_entries && !is_first_occurrence) {
+      const el = shadow.querySelector(`[data-instance_path="${CSS.escape(last_clicked_node)}"]`)
+      add_jump_button_to_matching_entry(el, base_path, last_clicked_node)
+    }
+    scroll_to_node(new_node.instance_path)
+  }
+
+  async function toggle_subs_for_current_node () {
+    if (!last_clicked_node) return
+
+    const base_path = last_clicked_node.split('|').pop()
+    const entry = await db.get(base_path)
+    const has_subs = Array.isArray(entry?.subs) && entry.subs.length > 0
+    if (!has_subs) return
+
+    if (hubs_flag === 'default') {
+      const has_duplicate_entries = has_duplicates(base_path)
+      const is_first_occurrence = is_first_duplicate(base_path, last_clicked_node)
+      if (has_duplicate_entries && !is_first_occurrence) return
+    }
+
+    if (mode === 'search' && search_query) {
+      await toggle_search_subs(last_clicked_node)
+    } else {
+      await toggle_subs(last_clicked_node)
+    }
+  }
+
+  async function toggle_hubs_for_current_node () {
+    if (!last_clicked_node) return
+
+    const base_path = last_clicked_node.split('|').pop()
+    const entry = await db.get(base_path)
+    const has_hubs = hubs_flag === 'false' ? false : Array.isArray(entry?.hubs) && entry.hubs.length > 0
+    if (!has_hubs || base_path === '/') return
+
+    if (hubs_flag === 'default') {
+      const has_duplicate_entries = has_duplicates(base_path)
+      const is_first_occurrence = is_first_duplicate(base_path, last_clicked_node)
+
+      if (has_duplicate_entries && !is_first_occurrence) return
+    }
+
+    if (mode === 'search' && search_query) {
+      await toggle_search_hubs(last_clicked_node)
+    } else {
+      await toggle_hubs(last_clicked_node)
+    }
+  }
+
+  function multiselect_current_node () {
+    if (!last_clicked_node || selection_flag === false) return
+
+    // IMPORTANT FIX!!!!! : synthetic event object for compatibility with existing functions
+    const synthetic_event = { ctrlKey: true, metaKey: false, shiftKey: false }
+
+    if (mode === 'search' && search_query) {
+      search_select_node(synthetic_event, last_clicked_node)
+    } else {
+      select_node(synthetic_event, last_clicked_node)
+    }
+  }
+
+  function select_between_current_node () {
+    if (!last_clicked_node || selection_flag === false) return
+
+    if (!select_between_enabled) {
+      // Enable select between mode and set first node
+      select_between_enabled = true
+      select_between_first_node = last_clicked_node
+      update_drive_state({ type: 'mode/select_between_enabled', message: true })
+      render_menubar()
+    } else {
+      // Complete the select between operation
+      const synthetic_event = { ctrlKey: false, metaKey: false, shiftKey: true }
+
+      if (mode === 'search' && search_query) {
+        search_select_node(synthetic_event, last_clicked_node)
+      } else {
+        select_node(synthetic_event, last_clicked_node)
+      }
+    }
+  }
+
+  function scroll_to_node (instance_path) {
+    const node_index = view.findIndex(node => node.instance_path === instance_path)
+    if (node_index === -1 || !node_height) return
+
+    const target_scroll_top = node_index * node_height
+    const container_height = container.clientHeight
+    const current_scroll_top = container.scrollTop
+
+    // Only scroll if the node is not fully visible
+    if (target_scroll_top < current_scroll_top || target_scroll_top + node_height > current_scroll_top + container_height) {
+      const centered_scroll_top = target_scroll_top - (container_height / 2) + (node_height / 2)
+      container.scrollTop = Math.max(0, centered_scroll_top)
+
+      vertical_scroll_value = container.scrollTop
+      drive_updated_by_scroll = true
+      update_drive_state({ type: 'runtime/vertical_scroll_value', message: vertical_scroll_value })
+    }
+  }
+
+  function jump_to_next_duplicate ({ base_path, current_instance_path }) {
+    if (hubs_flag === 'default') {
+      cycle_to_next_duplicate(base_path, current_instance_path)
+    }
+  }
+
+  /******************************************************************************
+  UNDO FUNCTIONALITY
+    - Implements undo functionality to revert drive state changes
+  ******************************************************************************/
+  async function undo (steps = 1) {
+    if (undo_stack.length === 0) {
+      console.warn('No actions to undo')
+      return
+    }
+
+    const actions_to_undo = Math.min(steps, undo_stack.length)
+    console.log(`Undoing ${actions_to_undo} action(s)`)
+
+    // Pop the specified number of actions from the stack
+    const snapshots_to_restore = []
+    for (let i = 0; i < actions_to_undo; i++) {
+      const snapshot = undo_stack.pop()
+      if (snapshot) snapshots_to_restore.push(snapshot)
+    }
+
+    // Restore the last snapshot's state
+    if (snapshots_to_restore.length > 0) {
+      const snapshot = snapshots_to_restore[snapshots_to_restore.length - 1]
+
+      try {
+        // Restore the state WITHOUT setting drive_updated_by_undo flag
+        // This allows onbatch to process the change and update the UI
+        await drive.put(`${snapshot.type}.json`, snapshot.value)
+
+        // Update the undo stack in drive (with flag to prevent tracking this update)
+        // drive_updated_by_undo = true
+        await drive.put('undo/stack.json', JSON.stringify(undo_stack))
+
+        console.log(`Undo completed: restored ${snapshot.type} to previous state`)
+
+        // Re-render menubar to update undo button count
+        render_menubar()
+      } catch (e) {
+        console.error('Failed to undo action:', e)
+      }
+    }
+  }
+}
+
+/******************************************************************************
+  FALLBACK CONFIGURATION
+    - This provides the default data and API configuration for the component,
+      following the pattern described in `instructions.md`.
+    - It defines the default datasets (`entries`, `style`, `runtime`) and their
+      initial values.
+  ******************************************************************************/
+function fallback_module () {
+  return {
+    api: fallback_instance
+  }
+  function fallback_instance () {
+    return {
+      drive: {
+        'style/': {
+          'theme.css': {
+            $ref: 'theme.css'
+          }
+        },
+        'runtime/': {
+          'node_height.json': { raw: '16' },
+          'vertical_scroll_value.json': { raw: '0' },
+          'horizontal_scroll_value.json': { raw: '0' },
+          'selected_instance_paths.json': { raw: '[]' },
+          'confirmed_selected.json': { raw: '[]' },
+          'instance_states.json': { raw: '{}' },
+          'search_entry_states.json': { raw: '{}' },
+          'last_clicked_node.json': { raw: 'null' },
+          'view_order_tracking.json': { raw: '{}' }
+        },
+        'mode/': {
+          'current_mode.json': { raw: '"menubar"' },
+          'previous_mode.json': { raw: '"menubar"' },
+          'search_query.json': { raw: '""' },
+          'multi_select_enabled.json': { raw: 'false' },
+          'select_between_enabled.json': { raw: 'false' }
+        },
+        'flags/': {
+          'hubs.json': { raw: '"default"' },
+          'selection.json': { raw: 'true' },
+          'recursive_collapse.json': { raw: 'true' }
+        },
+        'keybinds/': {
+          'navigation.json': {
+            raw: JSON.stringify({
+              ArrowUp: 'navigate_up_current_node',
+              ArrowDown: 'navigate_down_current_node',
+              'Control+ArrowDown': 'toggle_subs_for_current_node',
+              'Control+ArrowUp': 'toggle_hubs_for_current_node',
+              'Alt+s': 'multiselect_current_node',
+              'Alt+b': 'select_between_current_node',
+              'Control+m': 'toggle_search_mode',
+              'Alt+j': 'jump_to_next_duplicate'
+            })
+          }
+        },
+        'undo/': {
+          'stack.json': { raw: '[]' }
+        }
+      }
+    }
+  }
+}
+
+}).call(this)}).call(this,"/node_modules/graph-explorer/lib/graph_explorer.js")
+},{"./net_helper":3,"STATE":1}],3:[function(require,module,exports){
+(function (__filename){(function (){
+module.exports = net
+
+function net(id) {
+  const [label, _, sub, hub] = [`[${id}@${__filename}]`, {}, {}, {}]
+  const io = { invite, accept, on: {} }
+  return { io, _ }
+  function forward(to, M) {
+    for (const id of Object.keys(sub)) if (to.startsWith(id)) return sub[id].tx(M)
+    for (const id of Object.keys(hub)) if (to.startsWith(id)) hub[id].tx(M)
+    console.error(`[id] ${label} - cant forward to unknown recipient "${to}"`)
+  }
+  function invite(name, ids) {
+    if (!io.on[name]) throw new Error(`${label} no protocol handler for "${name}"`)
+    return Object.assign(invite, { ids })
+    function invite(tx) {
+      const rx = router(sub)
+      add(name, tx, tx.id, rx, sub)
+      return rx
+    }
+  }
+  function accept(invite) {
+    const rx = router(hub)
+    const tx = invite(Object.assign(rx, { id }))
+    for (const [name, to] of Object.entries(invite.ids)) {
+      if (hub[to]) throw new Error(`${label} already connected to "${to}"`)
+      if (!io.on[name]) throw new Error(`${label} no "${name}" protocol for "${to}"`)
+      add(name, tx, to, rx, hub)
+    }
+  }
+  function router($) {
+    return function rx(M) {
+      const { head: [by, to, mid] } = M
+      console.log(`[by] ${by}\n[to] ${to}\n[id]`, M)
+      if (to !== id) return forward(to, M)
+      if (!$[by]) throw new Error(`${label} unknown sender "${by}"`)
+      const { name } = $[by].state
+      if (!io.on[name]) throw new Error(`${label} no "${name}" protocol for "${to}"`)
+      io.on[name](M)
+    }
+  }
+  function add(name, tx, to, rx, $) {
+    if (_[name]) throw new Error(`${label} petname "${name}" is already in use`)
+    const state = { name, to, mid: 0 }
+    _[name] = send
+    $[to] = { rx, tx, state }
+    function send(type, refs = {}, data = null) {
+      const head = [id, to, state.mid++]
+      const meta = { time: Date.now(), stack: (new Error().stack) }
+      tx({ head, refs, type, data, meta })
+      return head
+    }
+  }
+}
+
+}).call(this)}).call(this,"/node_modules/graph-explorer/lib/net_helper/net_helper.js")
+},{}],4:[function(require,module,exports){
 (function (global){(function (){
 
 // ------------------------------------------
@@ -499,2318 +3693,7508 @@
 }));
 
 }).call(this)}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],2:[function(require,module,exports){
-(function (__filename){(function (){
-/******************************************************************************
-  STATE
-******************************************************************************/
-const STATE = require('STATE')
-const name = 'app'
-const statedb = STATE(__filename)
-const shopts = { mode: 'closed' }
-// ----------------------------------------
-const { sdb, subs: [get], sub_modules } = statedb(fallback_module, fallback_instance)
-function fallback_module () {
+},{}],5:[function(require,module,exports){
+(function (global){(function (){
+module.exports = function DEBUG (filename) {
+  return function (sid) { return create_context(filename, sid) }
+}
+
+const DEFAULT_FLAGS = {
+  show_default_entries: true
+}
+
+const scope = typeof window !== 'undefined' ? window : global
+
+if (!scope.__DEBUG_GLOBAL_STATE__) {
+  scope.__DEBUG_GLOBAL_STATE__ = {
+    flags: { ...DEFAULT_FLAGS },
+    listeners: []
+  }
+}
+
+const state = scope.__DEBUG_GLOBAL_STATE__
+
+function set_flag (name, value) {
+  if (state.flags[name] === value) return
+  state.flags[name] = value
+  state.listeners.forEach(notify)
+
+  function notify (listener) { listener(name, value) }
+}
+
+function get_flag (name) { return state.flags[name] }
+
+function get_flags () { return { ...state.flags } }
+
+function on_change (listener) {
+  state.listeners.push(listener)
+  return unsubscribe
+
+  function unsubscribe () { state.listeners = state.listeners.filter(keep) }
+  function keep (l) { return l !== listener }
+}
+
+function create_context (filename, sid) {
   return {
-    _: {
-      topnav: {},
-      theme_widget: {},
-      header: {},
-      footer: {}
+    get_flag,
+    get_flags,
+    set_flag,
+    on_change,
+    meta: { component: filename, sid }
+  }
+}
+
+}).call(this)}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+},{}],6:[function(require,module,exports){
+(function (global){(function (){
+module.exports = function DOCS (filename) {
+  return function create_docs (sid) { return create_context(filename, sid) }
+}
+
+const scope = typeof window !== 'undefined' ? window : global
+
+if (!scope.__DOCS_GLOBAL_STATE__) {
+  scope.__DOCS_GLOBAL_STATE__ = {
+    docs_mode_active: false,
+    docs_mode_listeners: [],
+    doc_display_callback: null,
+    action_registry: new Map(),
+    action_lookup: new Map(),
+    handler_doc_registry: new Map(),
+    docs_interaction_state: new WeakMap()
+  }
+}
+
+const state = scope.__DOCS_GLOBAL_STATE__
+state.action_lookup = state.action_lookup || new Map()
+state.handler_doc_registry = state.handler_doc_registry || new Map()
+state.docs_interaction_state = state.docs_interaction_state || new WeakMap()
+
+function set_docs_mode (active) {
+  if (state.docs_mode_active !== active) state.docs_interaction_state = new WeakMap()
+  state.docs_mode_active = active
+  state.docs_mode_listeners.forEach(listener => listener(active))
+}
+
+function get_docs_mode () { return state.docs_mode_active }
+
+function on_docs_mode_change (listener) {
+  state.docs_mode_listeners.push(listener)
+  return unsubscribe
+
+  function unsubscribe () {
+    state.docs_mode_listeners = state.docs_mode_listeners.filter(item => item !== listener)
+  }
+}
+
+function set_doc_display_handler (callback) { state.doc_display_callback = callback }
+
+function get_actions (sid) {
+  const actions = state.action_registry.get(sid)
+  if (!actions) throw new Error('DOCS: No actions registered for SID ' + sid)
+  return actions
+}
+
+function list_registered () { return Array.from(state.action_registry.keys()) }
+
+function get_toc (sid) {
+  return {
+    actions: state.action_registry.get(sid) || [],
+    handlers: state.handler_doc_registry.get(sid) || []
+  }
+}
+
+function register_handler_doc (meta) {
+  if (meta.doc === undefined || meta.doc === null) return
+  const list = state.handler_doc_registry.get(meta.sid) || []
+  if (list.some(entry => entry.doc === meta.doc)) return
+  list.push({ doc: meta.doc, component: meta.component })
+  state.handler_doc_registry.set(meta.sid, list)
+}
+
+function clear_handler_docs (sid) { state.handler_doc_registry.delete(sid) }
+
+function verify_actions (actions) {
+  if (!Array.isArray(actions)) throw new Error('DOCS: Actions must be array')
+  actions.forEach(validate_action)
+
+  function validate_action (action, index) {
+    if (!action.name || typeof action.name !== 'string') throw new Error(`DOCS: Action[${index}] Invalid 'name'`)
+    if (!action.info || typeof action.info !== 'string') throw new Error(`DOCS: Action[${index}] Invalid 'info'`)
+    if (!action.icon || typeof action.icon !== 'string') throw new Error(`DOCS: Action[${index}] Invalid 'icon'`)
+    if (!action.status || typeof action.status !== 'object') throw new Error(`DOCS: Action[${index}] Invalid 'status'`)
+    if (!action.steps || !Array.isArray(action.steps)) throw new Error(`DOCS: Action[${index}] Invalid 'steps'`)
+  }
+}
+
+async function display_doc (content, sid) {
+  let resolved_content = content
+  if (typeof content === 'function') {
+    resolved_content = await content()
+  } else if (content && typeof content.then === 'function') {
+    resolved_content = await content
+  }
+
+  if (state.doc_display_callback) {
+    return state.doc_display_callback({ content: resolved_content || 'No documentation available', sid })
+  }
+}
+
+function wrap_isolated (handler, meta) {
+  if (typeof handler !== 'function') throw new TypeError('DOCS: Isolated handler must be a function')
+
+  const isolated_handler = compile_handler(handler)
+  const real_state = get_handler_state(handler)
+  const initial_state = structuredClone(real_state)
+
+  return async function wrapped_handler (event) {
+    const docs_mode = state.docs_mode_active
+    if (docs_mode && event) {
+      if (event.preventDefault) event.preventDefault()
+      if (event.stopPropagation) event.stopPropagation()
+    }
+
+    let requested_action
+    const handler_state = docs_mode ? get_docs_state(real_state, initial_state) : real_state
+
+    function $ (action) {
+      if (requested_action !== undefined) throw new Error('DOCS: Handler already requested an action')
+      if (!action || typeof action !== 'string') throw new TypeError('DOCS: Action request must be a name')
+      requested_action = action
+    }
+    $.state = handler_state
+
+    const result = await isolated_handler.call(this, event, $)
+    if (requested_action !== undefined) return dispatch_action(meta.sid, requested_action, docs_mode)
+    if (docs_mode) await display_doc(meta.doc || 'No documentation available', meta.sid)
+    return result
+  }
+}
+
+function compile_handler (handler) {
+  // eslint-disable-next-line no-new-func
+  return new Function(`return (${handler})`)()
+}
+
+function get_handler_state (handler) {
+  const interaction_state = handler.opts && handler.opts.state
+  if (interaction_state === undefined) return {}
+  if (Object.getPrototypeOf(interaction_state) !== Object.prototype) {
+    throw new TypeError('DOCS: handler.opts.state must be a plain object')
+  }
+  structuredClone(interaction_state)
+  return interaction_state
+}
+
+function get_docs_state (real_state, initial_state) {
+  let interaction_state = state.docs_interaction_state.get(real_state)
+  if (!interaction_state) {
+    interaction_state = structuredClone(initial_state)
+    state.docs_interaction_state.set(real_state, interaction_state)
+  }
+  return interaction_state
+}
+
+function dispatch_action (sid, name, docs_mode) {
+  const lookup = state.action_lookup.get(sid)
+  const record = lookup && lookup.get(name)
+  if (!record) throw new Error(`DOCS: Unknown action "${name}" for SID ${sid}`)
+  if (docs_mode) return display_doc(record.action.info, sid)
+  if (!record.run) throw new Error(`DOCS: Action "${record.action.name}" has no run callback`)
+  return record.run()
+}
+
+function register_actions (sid, actions) {
+  verify_actions(actions)
+  const public_actions = []
+  const lookup = new Map()
+
+  actions.forEach(register_action)
+  state.action_registry.set(sid, public_actions)
+  state.action_lookup.set(sid, lookup)
+
+  function register_action (action) {
+    const { run, ...public_action } = action
+    if (run !== undefined && typeof run !== 'function') throw new TypeError(`DOCS: Action "${action.name}" run must be a function`)
+
+    const record = { action: public_action, run }
+    const keys = new Set([action.name, action.name.toLowerCase().replace(/ /g, '_')])
+    keys.forEach(register_key)
+    if (!action.status.hidden) public_actions.push(public_action)
+
+    function register_key (key) {
+      if (lookup.has(key)) throw new Error(`DOCS: Duplicate action key "${key}" for SID ${sid}`)
+      lookup.set(key, record)
     }
   }
 }
-function fallback_instance () {
+
+let admin = true
+function create_context (filename, sid) {
+  const api = {
+    wrap_isolated: wrap_with_component,
+    get_docs_mode,
+    on_docs_mode_change,
+    get_toc: () => get_toc(sid),
+    clear_handler_docs: () => clear_handler_docs(sid),
+    register_actions: actions => register_actions(sid, actions)
+  }
+  const admin_api = {
+    set_docs_mode,
+    set_doc_display_handler,
+    get_actions,
+    get_toc,
+    clear_handler_docs,
+    list_registered
+  }
+  if (admin) {
+    admin = false
+    return Object.assign({ admin: admin_api }, api)
+  }
+  return api
+
+  function wrap_with_component (handler) {
+    const meta = { doc: handler && handler.info, sid, component: filename }
+    register_handler_doc(meta)
+    return wrap_isolated(handler, meta)
+  }
+}
+
+}).call(this)}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+},{}],7:[function(require,module,exports){
+(function (__filename){(function (){
+const STATE = require('STATE')
+const statedb = STATE(__filename)
+const { get } = statedb(fallback_module)
+const DOCS = require('DOCS')
+const net = require('net_helper')
+
+const quick_actions = require('quick_actions')
+
+module.exports = action_bar
+
+async function action_bar (opts, invite) {
+  const { id, sdb } = await get(opts.sid)
+  const { drive } = sdb
+
+  const on = {
+    style: inject,
+    icons: iconject
+  }
+
+  const el = document.createElement('div')
+  const shadow = el.attachShadow({ mode: 'closed' })
+
+  shadow.innerHTML = `
+  <div class="container">
+    <div class="action-bar-container main">
+      <div class="command-history">
+        <button class="icon-btn"></button>
+      </div>
+      <div class="quick-actions">
+        <quick-actions></quick-actions>
+      </div>
+    </div>
+  </div>`
+  const sheet = new CSSStyleSheet()
+  shadow.adoptedStyleSheets = [sheet]
+  const history_icon = shadow.querySelector('.icon-btn')
+  const quick_placeholder = shadow.querySelector('quick-actions')
+
+  const { io, _ } = net(id)
+  let console_icon = {}
+  const docs = DOCS(__filename)(opts.sid)
+  const history_action = {
+    name: 'Toggle Console History',
+    info: 'Open or close the console history.',
+    icon: 'console',
+    status: { hidden: true },
+    steps: [],
+    run: toggle_console_history
+  }
+  docs.register_actions([history_action])
+  const subs = await sdb.watch(onbatch)
+
+  let selected_action = null
+
+  io.on = {
+    up: io_up(),
+    quick_actions: io_quick_actions()
+  }
+  if (invite) io.accept(invite)
+
+  history_icon.innerHTML = console_icon
+  on_history_click.info = history_action.info
+  history_icon.onclick = docs.wrap_isolated(on_history_click)
+  const element = await quick_actions({ ...subs[0] }, io.invite('quick_actions', { up: id }))
+  quick_placeholder.replaceWith(element)
+
+  const parent_handler = {
+    load_actions,
+    selected_action: parent_selected_action,
+    show_submit_btn,
+    hide_submit_btn,
+    step_clicked: parent_step_clicked,
+    update_quick_actions_for_app,
+    update_quick_actions_input,
+    action_submitted: parent__action_submitted,
+    clean_up: parent__clean_up
+  }
+
+  return el
+
+  async function onbatch (batch) {
+    for (const { type, paths } of batch) {
+      const data = await Promise.all(paths.map(load_path_raw))
+      const func = on[type] || fail
+      func({ data, type })
+    }
+
+    function load_path_raw (path) { return drive.get(path).then(read_drive_file_raw) }
+    function read_drive_file_raw (file) { return file.raw }
+  }
+
+  function fail ({ data, type }) { console.warn('Unknown message type:', type, data) }
+  function inject ({ data }) { sheet.replaceSync(data[0]) }
+  function iconject ({ data }) { console_icon = data[0] }
+
+  // -------------------------------
+  // Protocol: quick actions
+  // -------------------------------
+
+  function io_quick_actions () {
+    return function quick_actions_protocol (msg) {
+      const quick_handlers = {
+        display_actions: quick_actions_display_actions,
+        action_submitted: quick_actions_action_submitted,
+        filter_actions: quick_actions_filter_actions,
+        update_quick_actions_input,
+        activate_steps_wizard: quick_actions_activate_steps_wizard,
+        ui_focus_docs
+      }
+
+      const { type } = msg
+      const handler = quick_handlers[type] || fail
+      handler(msg)
+    }
+  }
+
+  function quick_actions_filter_actions (msg) { _.up(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+  function quick_actions_display_actions (msg) {
+    const { data } = msg
+    _.up(msg.type, msg.head ? { cause: msg.head } : {}, msg.data)
+    const display = typeof data === 'string' ? data : data.display
+    const reason = typeof data === 'string' ? '' : data.reason
+    const should_clean = display === 'none' && reason !== 'selected'
+    if (should_clean) {
+      _.up('clean_up', msg.head ? { cause: msg.head } : {}, selected_action)
+    }
+  }
+
+  function quick_actions_action_submitted (msg) {
+    _.quick_actions('deactivate_input_field', msg.head ? { cause: msg.head } : {}, { reason: 'completed' })
+    _.up('action_submitted', msg.head ? { cause: msg.head } : {}, { selected_action })
+  }
+
+  function io_up () {
+    return function onmessage (msg) {
+      const { type } = msg
+      if (type === 'docs_toggle') {
+        _.quick_actions(type, msg.head ? { cause: msg.head } : {}, msg.data)
+      } else {
+        const handler = parent_handler[type] || fail
+        handler(msg)
+      }
+    }
+  }
+
+  function load_actions (msg) {
+    // const { data } = msg
+  }
+  function parent_selected_action (msg) {
+    _.quick_actions(msg.type, msg.head ? { cause: msg.head } : {}, msg.data)
+  }
+  function show_submit_btn (msg) { _.quick_actions('show_submit_btn', msg.head ? { cause: msg.head } : {}, null) }
+  function hide_submit_btn (msg) { _.quick_actions('hide_submit_btn', msg.head ? { cause: msg.head } : {}, null) }
+
+  function update_quick_actions_for_app (msg) {
+    const { data, type } = msg
+    _.quick_actions(type, msg.head ? { cause: msg.head } : {}, data)
+  }
+
+  function update_quick_actions_input (msg) {
+    const { data } = msg
+    selected_action = data || null
+    _.quick_actions('update_input_command', msg.head ? { cause: msg.head } : {}, data)
+  }
+
+  function quick_actions_activate_steps_wizard (msg) {
+    _.up('activate_steps_wizard', msg.head ? { cause: msg.head } : {}, msg.data)
+  }
+
+  function parent_step_clicked (msg) {
+    const { data } = msg
+    _.quick_actions('update_current_step', msg.head ? { cause: msg.head } : {}, data)
+    _.up('render_form', msg.head ? { cause: msg.head } : {}, data)
+  }
+
+  function parent__action_submitted (msg) {
+    _.quick_actions('deactivate_input_field', msg.head ? { cause: msg.head } : {}, { reason: 'completed' })
+    _.up('action_submitted', msg.head ? { cause: msg.head } : {}, msg.data)
+  }
+
+  function parent__clean_up (msg) {
+    _.quick_actions('deactivate_input_field', msg.head ? { cause: msg.head } : {}, { reason: 'cancel' })
+    _.up('clean_up', msg.head ? { cause: msg.head } : {}, msg.data)
+  }
+
+  function ui_focus_docs (msg) { _.up(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+
+  function on_history_click (event, $) { $('Toggle Console History') }
+  function toggle_console_history () { _.up('console_history_toggle', {}, null) }
+}
+
+function fallback_module () {
   return {
+    api: fallback_instance,
     _: {
-      topnav: {},
-      theme_widget: {},
-      header: {},
-      footer: {}
-    },
-    inputs: {
-      'app.css': {
-        $ref: new URL('src/node_modules/css/default/app.css', location).href
+      quick_actions: { $: '' },
+      DOCS: { $: '' },
+      net_helper: { $: '' }
+    }
+  }
+  function fallback_instance () {
+    return {
+      _: {
+        quick_actions: {
+          0: '',
+          mapping: {
+            style: 'style',
+            icons: 'icons',
+            actions: 'actions',
+            hardcons: 'hardcons',
+            prefs: 'prefs',
+            docs: 'docs'
+          }
+        },
+        DOCS: {
+          0: ''
+        },
+        net_helper: {
+          0: ''
+        }
+      },
+      drive: {
+        'icons/': {
+          'console.svg': {
+            $ref: 'console.svg'
+          }
+        },
+        'docs/': {
+          'README.md': {
+            $ref: 'README.md'
+          }
+        },
+        'style/': {
+          'theme.css': {
+            raw: `
+              .container {
+                display: flex;
+                flex-direction: column;
+                width: 100%;
+              }
+              .action-bar-container {
+                display: flex;
+                flex-direction: row;
+                flex-wrap: nowrap;
+                align-items: center;
+                background: #131315;
+                padding: 8px;
+                gap: 12px;
+              }
+              .command-history {
+                display: flex;
+                align-items: center;
+              }
+              .quick-actions {
+                display: flex;
+                flex: auto;
+                flex-direction: row;
+                flex-wrap: nowrap;
+                align-items: center;
+                min-width: 340px;
+              }
+              .hide {
+                display: none;
+              }
+              
+              .icon-btn {
+                display: flex;
+                min-width: 32px;
+                height: 32px;
+                border: none;
+                background: transparent;
+                cursor: pointer;
+                flex-direction: row;
+                justify-content: center;
+                align-items: center;
+                padding: 6px;
+                border-radius: 6px;
+                color: #a6a6a6;
+              }
+              .icon-btn:hover {
+                background: rgba(255, 255, 255, 0.1);
+              }
+              svg {
+                width: 20px;
+                height: 20px;
+              }
+            `
+          }
+        },
+        'actions/': {},
+        'hardcons/': {},
+        'prefs/': {},
+        'variables/': {}
       }
     }
   }
 }
-function override ([topnav]) {
-  const data = topnav()
-  console.log(data)
-  data['topnav.json'].data.links.push({
-    id: 'app',
-    text: 'app',
-    url: 'app'
-  })
-  return data
-}
-/******************************************************************************
-  MAKE_PAGE COMPONENT
-******************************************************************************/
-const IO = require('io')
-const modules = {
-  [sub_modules.theme_widget]: require('theme_widget'),
-  [sub_modules.topnav]: require('topnav'),
-  [sub_modules.header]: require('header'),
-  //  datdot : require('datdot'),
-  //  editor : require('editor'),
-  //  smartcontract_codes : require('smartcontract_codes'),
-  //  supporters : require('supporters'),
-  //  our_contributors : require('our_contributors'),
-  [sub_modules.footer]: require('footer')
-}
-module.exports = app
 
-async function app (opts) {
-  // ----------------------------------------
-  // ID + JSON STATE
-  // ----------------------------------------
+}).call(this)}).call(this,"/node_modules/ui-components/src/node_modules/action_bar/action_bar.js")
+},{"DOCS":6,"STATE":1,"net_helper":18,"quick_actions":21}],8:[function(require,module,exports){
+(function (__filename){(function (){
+const STATE = require('STATE')
+const statedb = STATE(__filename)
+const { get } = statedb(fallback_module)
+const net = require('net_helper')
+
+const program = require('program')
+const steps_wizard = require('steps_wizard')
+
+const { form_input, input_test, form_tile_split_choice, form_click_rate_test } = program
+
+const component_modules = {
+  form_input,
+  input_test,
+  form_tile_split_choice,
+  form_click_rate_test
+  // Add more form input components here if needed
+}
+
+module.exports = action_executor
+
+async function action_executor (opts, invite) {
   const { id, sdb } = await get(opts.sid)
+  const { drive } = sdb
+
   const on = {
-    jump,
-    css: inject
+    style: inject
   }
 
-  const send = await IO(id, name, on)
-  // ----------------------------------------
-  // TEMPLATE
-  // ----------------------------------------
   const el = document.createElement('div')
-  const shadow = el.attachShadow(shopts)
+  const shadow = el.attachShadow({ mode: 'closed' })
   shadow.innerHTML = `
-  <div id="top" class='wrap'></div>
-  <style></style>`
-  const style = shadow.querySelector('style')
-  const main = shadow.querySelector('div')
+  <div class="container main">
+    <program></program>
+    <form-input></form-input>
+    <steps-wizard></steps-wizard>
+  </div>`
+
+  const sheet = new CSSStyleSheet()
+  shadow.adoptedStyleSheets = [sheet]
+  const program_placeholder = shadow.querySelector('program')
+  const form_input_placeholder = shadow.querySelector('form-input')
+  const steps_wizard_placeholder = shadow.querySelector('steps-wizard')
+  const { io, _ } = net(id)
 
   const subs = await sdb.watch(onbatch)
 
-  console.log(subs, modules)
-  main.append(...await Promise.all(
-    subs.map(async ({ sid, type }) => {
-      const el = document.createElement('div')
-      el.name = type
-      const shadow = el.attachShadow(shopts)
-      shadow.append(await modules[type]({ sid, hub: [id] }))
-      return el
-    })))
+  let all_data = null
+  let selected_action = null
+
+  io.on = {
+    up: io_up(),
+    program: io_program(),
+    steps_wizard: io_steps_wizard()
+  }
+
+  // dynamic form input component SIDs
+  for (const [component_name] of Object.entries(component_modules)) {
+    // const final_index = index + 2
+    io.on[component_name] = io_form_input(component_name)
+  }
+  if (invite) io.accept(invite)
+
+  const program_el = await program({ ...subs[0] }, io.invite('program', { up: id }))
+  program_el.classList.add('program-bar', 'hide')
+  program_placeholder.replaceWith(program_el)
+
+  const steps_wizard_el = await steps_wizard({ ...subs[1] }, io.invite('steps_wizard', { up: id }))
+  steps_wizard_el.classList.add('steps-wizard-bar', 'hide')
+  steps_wizard_placeholder.replaceWith(steps_wizard_el)
+
+  const form_input_elements = {}
+
+  for (const [index, [component_name, component_fn]] of Object.entries(component_modules).entries()) {
+    const final_index = index + 2
+    const sub_entry = subs[final_index] || { sid: opts.sid }
+    const element = await component_fn({ ...sub_entry }, io.invite(component_name, { up: id }))
+    element.classList.add('form-inputs', 'hide')
+    form_input_elements[component_name] = element
+    form_input_placeholder.parentNode.insertBefore(element, form_input_placeholder)
+  }
+
+  form_input_placeholder.remove()
+
+  const parent_handler = {
+    update_steps_wizard_for_app,
+    load_actions,
+    action_submitted,
+    update_data,
+    activate_steps_wizard,
+    form_data,
+    render_form,
+    selected_action: parent_selected_action,
+    clean_up
+  }
+
   return el
 
-  function onbatch (batch) {
-    for (const { type, data } of batch) {
-      on[type](data)
+  async function onbatch (batch) {
+    for (const { type, paths } of batch) {
+      const data = await Promise.all(paths.map(load_path_raw))
+      const func = on[type] || fail
+      func(data, type)
+    }
+
+    function load_path_raw (path) { return drive.get(path).then(read_drive_file_raw) }
+    function read_drive_file_raw (file) { return file.raw }
+  }
+  function fail (data, type) { console.warn('Unknown message type:', type, data) }
+  function inject (data) { sheet.replaceSync(data[0]) }
+
+  // --- Toggle Views ---
+  function toggle_view (el, show) { el.classList.toggle('hide', !show) }
+  function steps_toggle_view (display) { toggle_view(steps_wizard_el, display === 'block') }
+
+  function render_form_component (component_name) {
+    for (const name in form_input_elements) {
+      toggle_view(form_input_elements[name], name === component_name)
     }
   }
-  async function jump ({ data }) {
-    main.querySelector('#' + data).scrollIntoView({ behavior: 'smooth' })
+
+  function hide_all_forms () {
+    for (const name in form_input_elements) {
+      toggle_view(form_input_elements[name], false)
+    }
   }
-  async function inject (data) {
-    style.innerHTML = data.join('\n')
+
+  // -------------------------------
+  // Protocol: program
+  // -------------------------------
+
+  function io_program () {
+    return function program_protocol (msg) {
+      const program_handlers = {
+        load_actions: program_load_actions
+      }
+      const { type, data } = msg
+      const handler = program_handlers[type] || fail
+      handler(data, type, msg)
+    }
+  }
+
+  function program_load_actions (data, type, msg) {
+    _.up(type, msg.head ? { cause: msg.head } : {}, data)
+  }
+
+  // -------------------------------
+  // Protocol: steps wizard
+  // -------------------------------
+
+  function io_steps_wizard () {
+    return function steps_wizard_protocol (msg) {
+      const steps_handlers = {
+        step_clicked: steps_wizard_step_clicked
+      }
+
+      const { type } = msg
+      const handler = steps_handlers[type]
+      if (handler) handler(msg)
+      else _.up(type, msg.head ? { cause: msg.head } : {}, msg.data)
+    }
+  }
+
+  function steps_wizard_step_clicked (msg) {
+    const { data } = msg
+    const refs = msg.head ? { cause: msg.head } : {}
+    _.up('step_clicked', refs, data)
+
+    if (should_execute_step(data)) {
+      _.up('execute_step', refs, {
+        action: selected_action,
+        step: data,
+        commands: data.commands
+      })
+    }
+
+    function should_execute_step (step_data) {
+      return step_data && Array.isArray(step_data.commands) && step_data.commands.length > 0
+    }
+  }
+
+  // -------------------------------
+  // Protocol: form input
+  // -------------------------------
+
+  function io_form_input (component_name) {
+    return function form_input_protocol (msg) {
+      const form_input_handlers = {
+        action_submitted: form_action_submitted,
+        action_incomplete: form_action_incomplete,
+        action_complete: form__action_complete
+      }
+      const { type, data } = msg
+      const handler = form_input_handlers[type] || fail
+      handler(data, type, msg)
+    }
+  }
+
+  function form_action_submitted (data, type, msg) {
+    console.error('action_executor: form_action_submitted', data, 'selected_action:', selected_action)
+    const step = selected_action.steps[data?.index]
+    Object.assign(step, {
+      is_completed: true,
+      status: 'completed',
+      data: data.value
+    })
+    console.error('action_executor: step updated', step)
+
+    const refs = msg.head ? { cause: msg.head } : {}
+    _.program('update_data', refs, all_data)
+    _.steps_wizard('init_data', refs, selected_action.steps)
+
+    if (selected_action.steps[selected_action.steps.length - 1]?.is_completed) {
+      _.up('show_submit_btn', refs, null)
+    }
+  }
+
+  function form_action_incomplete (data, type, msg) {
+    console.error('action_executor: form_action_incomplete', data)
+    const step = selected_action.steps[data?.index]
+
+    if (!step.is_completed) return
+
+    Object.assign(step, {
+      is_completed: false,
+      status: 'error',
+      data: data.value !== undefined ? data.value : undefined
+    })
+    const refs = msg.head ? { cause: msg.head } : {}
+    _.program('update_data', refs, all_data)
+    _.steps_wizard('init_data', refs, selected_action.steps)
+    _.up('hide_submit_btn', refs, null)
+  }
+
+  function form__action_complete (data, type, msg) {
+    console.error('action_executor: form__action_complete', data, 'selected_action:', selected_action)
+    if (!selected_action || !selected_action.steps) {
+      console.error('action_executor: no selected_action or steps')
+      return
+    }
+
+    const all_mandatory_complete = selected_action.steps.every(is_step_complete_or_optional)
+    console.error('action_executor: all_mandatory_complete:', all_mandatory_complete)
+
+    if (all_mandatory_complete) {
+      hide_all_forms()
+      _.up('action_auto_completed', msg.head ? { cause: msg.head } : {}, { selected_action, trigger: 'form' })
+    }
+
+    function is_step_complete_or_optional (step) {
+      return step.is_completed || step.type === 'optional'
+    }
+  }
+
+  // -------------------------------
+  // onmessage from parent
+  // -------------------------------
+
+  function io_up () {
+    return function onmessage (msg) {
+      const { type } = msg
+      if (type === 'docs_toggle') {
+        _.steps_wizard(type, msg.head ? { cause: msg.head } : {}, msg.data)
+        for (const name in component_modules) {
+          _[name](type, msg.head ? { cause: msg.head } : {}, msg.data)
+        }
+      } else {
+        parent_handler[type](msg)
+      }
+    }
+  }
+
+  function update_steps_wizard_for_app (msg) {
+    const { data } = msg
+    all_data = data
+  }
+
+  function load_actions (msg) {
+    _.program(msg.type, msg.head ? { cause: msg.head } : {}, msg.data)
+  }
+
+  function action_submitted (msg) {
+    const { data } = msg
+    data.result = JSON.stringify(selected_action.steps.map(step => step.data), null, 2)
+
+    reset_selected_action_steps()
+    _.program('display_result', msg.head ? { cause: msg.head } : {}, data)
+  }
+
+  function reset_selected_action_steps () {
+    if (!selected_action?.steps) return
+
+    selected_action.steps.forEach(step => {
+      step.data = ''
+      step.is_completed = false
+    })
+  }
+
+  function render_form (msg) {
+    const { data } = msg
+    render_form_component(data.component)
+    const send = _[data.component]
+    if (send) {
+      send('step_data', msg.head ? { cause: msg.head } : {}, data)
+    }
+  }
+
+  function parent_selected_action (msg) { selected_action = msg.data }
+
+  function update_data (msg) {
+    const { data: msg_data, type } = msg
+    _.program(type, msg.head ? { cause: msg.head } : {}, msg_data)
+  }
+
+  function activate_steps_wizard (msg) {
+    if (!all_data) return
+    const steps_data = all_data.find(matches_selected_action)
+    selected_action = steps_data
+    if (!steps_data) return
+    steps_toggle_view('block')
+    const data = steps_data.steps
+    _.steps_wizard('init_data', msg.head ? { cause: msg.head } : {}, data)
+
+    function matches_selected_action (action) {
+      const target = typeof msg.data === 'string' ? msg.data : msg.data?.name
+      return action.name === target
+    }
+  }
+
+  function form_data (msg) {
+    // forward init_data to steps_wizard with current action steps
+    _.steps_wizard('init_data', msg.head ? { cause: msg.head } : {}, msg.data)
+  }
+
+  function clean_up (msg) {
+    steps_toggle_view('none')
+    for (const el of Object.values(form_input_elements)) {
+      toggle_view(el, false)
+    }
+  }
+}
+
+function fallback_module () {
+  return {
+    api: fallback_instance,
+    _: {
+      program: { $: '' },
+      steps_wizard: { $: '' },
+      net_helper: { $: '' }
+    }
+  }
+  function fallback_instance () {
+    return {
+      _: {
+        program: {
+          0: '',
+          mapping: {
+            style: 'style',
+            variables: 'variables',
+            docs: 'docs'
+          }
+        },
+        steps_wizard: {
+          0: '',
+          mapping: {
+            style: 'style',
+            variables: 'variables',
+            docs: 'docs'
+          }
+        },
+        'program>form_input': {
+          0: '',
+          mapping: {
+            style: 'style',
+            data: 'data',
+            docs: 'docs'
+          }
+        },
+        'program>input_test': {
+          0: '',
+          mapping: {
+            style: 'style',
+            data: 'data',
+            docs: 'docs'
+          }
+        },
+        'program>form_tile_split_choice': {
+          0: '',
+          mapping: {
+            style: 'style',
+            data: 'data',
+            docs: 'docs'
+          }
+        },
+        'program>form_click_rate_test': {
+          0: '',
+          mapping: {
+            style: 'style',
+            data: 'data',
+            docs: 'docs'
+          }
+        },
+        net_helper: {
+          0: ''
+        }
+      },
+      drive: {
+        'style/': {
+          'action_executor.css': {
+            raw: `
+              .container {
+                display: flex;
+                flex-direction: column;
+                width: 100%;
+              }
+              .program-bar {
+                display: flex;
+              }
+              .form-inputs {
+                display: flex;
+              }
+              .steps-wizard-bar {
+                display: flex;
+              }
+              .hide {
+                display: none;
+              }
+            `
+          }
+        },
+        'variables/': {},
+        'data/': {},
+        'docs/': {}
+      }
+    }
+  }
+}
+
+}).call(this)}).call(this,"/node_modules/ui-components/src/node_modules/action_executor/action_executor.js")
+},{"STATE":1,"net_helper":18,"program":19,"steps_wizard":22}],9:[function(require,module,exports){
+(function (__filename){(function (){
+const STATE = require('STATE')
+const statedb = STATE(__filename)
+const { get } = statedb(fallback_module)
+const DOCS = require('DOCS')
+const net = require('net_helper')
+
+module.exports = actions
+
+async function actions (opts, invite) {
+  const { id, sdb } = await get(opts.sid)
+  const { drive } = sdb
+
+  const on = {
+    style: inject,
+    actions: onactions,
+    icons: iconject,
+    hardcons: onhardcons
+  }
+
+  const el = document.createElement('div')
+  const shadow = el.attachShadow({ mode: 'closed' })
+
+  shadow.innerHTML = `
+  <div class="actions-container main">
+    <div class="actions-menu"></div>
+  </div>`
+  const sheet = new CSSStyleSheet()
+  shadow.adoptedStyleSheets = [sheet]
+  const actions_menu = shadow.querySelector('.actions-menu')
+
+  let init = false
+  let actions = []
+  let icons = {}
+  let hardcons = {}
+  const docs = DOCS(__filename)(opts.sid)
+  const on_message = {
+    filter_actions: handle_filter_actions,
+    send_selected_action: handle_send_selected_action,
+    load_actions: handle_load_actions_message,
+    update_actions_for_app: handle_update_actions_for_app_message
+  }
+  const { io, _ } = net(id)
+
+  await sdb.watch(onbatch)
+  io.on = {
+    up: io_up()
+  }
+  if (invite) io.accept(invite)
+
+  return el
+
+  function io_up () {
+    return function onmessage (msg) {
+      const handler = on_message[msg.type] || onmessage_fail
+      handler(msg)
+    }
+  }
+
+  function handle_filter_actions (msg) { filter(msg.data) }
+  function handle_send_selected_action (msg) {
+    _.up('selected_action', msg.head ? { cause: msg.head } : {}, msg.data)
+  }
+  function handle_load_actions_message (msg) { handle_load_actions(msg.data) }
+  function handle_update_actions_for_app_message (msg) { update_actions_for_app(msg.data) }
+  function onmessage_fail (msg) { fail(msg.data, msg.type) }
+  function handle_load_actions (data) {
+    const converted_actions = Object.keys(data).map(convert_action_key)
+    actions = converted_actions
+    if (actions.length > 0) register_actions()
+    create_actions_menu()
+
+    function convert_action_key (action_key) {
+      return {
+        name: action_key,
+        info: 'Run the ' + action_key + ' action.',
+        icon: 'file',
+        status: { pinned: false, default: true },
+        steps: []
+      }
+    }
+  }
+
+  async function onbatch (batch) {
+    for (const { type, paths } of batch) {
+      const data = await Promise.all(paths.map(load_path_raw))
+      const func = on[type] || fail
+      func(data, type)
+    }
+    if (!init) {
+      create_actions_menu()
+      init = true
+    }
+
+    function load_path_raw (path) { return drive.get(path).then(read_drive_file_raw) }
+    function read_drive_file_raw (file) { return file.raw }
+  }
+
+  function fail (data, type) { console.warn('invalid message', { cause: { data, type } }) }
+
+  function inject (data) { sheet.replaceSync(data[0]) }
+  function iconject (data) { icons = data }
+
+  function onhardcons (data) {
+    console.log('Hardcons data:', opts.sid, data)
+    hardcons = {
+      pin: data[0],
+      unpin: data[1],
+      default: data[2],
+      undefault: data[3]
+    }
+  }
+
+  function onactions (data) {
+    const vars = typeof data[0] === 'string' ? JSON.parse(data[0]) : data[0]
+    actions = vars
+    if (actions.length > 0) register_actions()
+    create_actions_menu()
+  }
+
+  function create_actions_menu () {
+    actions_menu.replaceChildren()
+    actions.forEach(create_action_item)
+  }
+
+  function create_action_item (action_data, index) {
+    const action_item = document.createElement('div')
+    action_item.classList.add('action-item')
+
+    const this_icon = icons[index] || icons[0]
+    action_item.innerHTML = `
+    <div class="action-icon">${this_icon}</div>
+    <div class="action-name">${action_data.name}</div>
+    <div class="action-pin">${action_data.status && action_data.status.pinned ? hardcons.pin : hardcons.unpin}</div>
+    <div class="action-default">${action_data.status && action_data.status.default ? hardcons.default : hardcons.undefault}</div>`
+    on_action_click.info = action_data.info
+    on_action_click.opts = { state: { name: action_data.name } }
+    action_item.onclick = docs.wrap_isolated(on_action_click)
+    actions_menu.appendChild(action_item)
+
+    function on_action_click (event, $) { $($.state.name) }
+  }
+
+  function register_actions () {
+    docs.register_actions(actions.map(bind_action))
+
+    function bind_action (action) {
+      return { ...action, run: run_action }
+
+      function run_action () { _.up('selected_action', {}, action) }
+    }
+  }
+
+  function filter (search_term) {
+    const items = shadow.querySelectorAll('.action-item')
+    items.forEach(update_item_visibility)
+
+    function update_item_visibility (item) {
+      const action_name = item.children[1].textContent.toLowerCase()
+      const matches = action_name.includes(search_term.toLowerCase())
+      item.style.display = matches ? 'flex' : 'none'
+    }
+  }
+
+  async function update_actions_for_app (data) {
+    if (data) {
+      drive.put('actions/commands.json', data)
+    }
+  }
+}
+
+function fallback_module () {
+  return {
+    api: fallback_instance,
+    _: {
+      DOCS: {
+        $: ''
+      },
+      net_helper: {
+        $: ''
+      }
+    }
+  }
+
+  function fallback_instance () {
+    return {
+      _: {
+        DOCS: {
+          0: ''
+        },
+        net_helper: {
+          0: ''
+        }
+      },
+      drive: {
+        'actions/': {
+          'commands.json': {
+            raw: JSON.stringify([])
+          }
+        },
+        'icons/': {
+          'file.svg': {
+            $ref: 'icon.svg'
+          },
+          'folder.svg': {
+            $ref: 'icon.svg'
+          },
+          'save.svg': {
+            $ref: 'icon.svg'
+          },
+          'gear.svg': {
+            $ref: 'icon.svg'
+          },
+          'help.svg': {
+            $ref: 'icon.svg'
+          },
+          'terminal.svg': {
+            $ref: 'icon.svg'
+          },
+          'search.svg': {
+            $ref: 'icon.svg'
+          }
+        },
+        'hardcons/': {
+          'pin.svg': {
+            $ref: 'pin.svg'
+          },
+          'unpin.svg': {
+            $ref: 'unpin.svg'
+          },
+          'default.svg': {
+            $ref: 'default.svg'
+          },
+          'undefault.svg': {
+            $ref: 'undefault.svg'
+          }
+        },
+        'docs/': {
+          'README.md': {
+            $ref: 'README.md'
+          }
+        },
+        'style/': {
+          'theme.css': {
+            raw: `
+              .actions-container {
+                position: relative;
+                background: #202124;
+                border: 1px solid #3c3c3c;
+                border-radius: 8px;
+                box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+                height: auto;
+                max-height: 100%;
+                min-height: 0;
+                width: 100%;
+                box-sizing: border-box;
+                overflow-y: auto;
+                scrollbar-gutter: stable;
+                scrollbar-width: thin;
+                scrollbar-color: #3c3c3c transparent;
+                color: #e8eaed;
+              }
+
+              .actions-container::-webkit-scrollbar {
+                width: 10px;
+                height: 10px;
+              }
+
+              .actions-container::-webkit-scrollbar-track {
+                background: transparent;
+              }
+
+              .actions-container::-webkit-scrollbar-thumb {
+                background: #3c3c3c;
+                border: 2px solid transparent;
+                border-radius: 999px;
+                background-clip: content-box;
+              }
+
+              .actions-container::-webkit-scrollbar-thumb:hover {
+                background: #5f6368;
+                border: 2px solid transparent;
+                background-clip: content-box;
+              }
+              
+              .actions-menu {
+                padding: 8px 0;
+              }
+              
+              .action-item {
+                display: flex;
+                align-items: center;
+                gap: 12px;
+                padding: 8px 16px;
+                cursor: pointer;
+                border-bottom: 1px solid #3c3c3c;
+                transition: background-color 0.2s ease;
+              }
+              
+              .action-item:hover {
+                background-color: #2d2f31;
+              }
+              
+              .action-item:last-child {
+                border-bottom: none;
+              }
+              
+              .action-icon {
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                width: 20px;
+                height: 20px;
+                color: #a6a6a6;
+              }
+              
+              .action-name {
+                flex: 1;
+                font-size: 14px;
+                color: #e8eaed;
+              }
+              
+              .action-pin .action-default{
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                width: 16px;
+                height: 16px;
+                font-size: 12px;
+                opacity: 0.7;
+                color: #a6a6a6;
+              }
+              
+              svg {
+                width: 16px;
+                height: 16px;
+              }
+            `
+          }
+        }
+      }
+    }
+  }
+}
+
+}).call(this)}).call(this,"/node_modules/ui-components/src/node_modules/actions/actions.js")
+},{"DOCS":6,"STATE":1,"net_helper":18}],10:[function(require,module,exports){
+(function (__filename){(function (){
+const STATE = require('STATE')
+const statedb = STATE(__filename)
+const { get } = statedb(fallback_module)
+const DOCS = require('DOCS')
+const DEBUG = require('DEBUG')
+const net = require('net_helper')
+
+module.exports = console_history
+
+async function console_history (opts, invite) {
+  const { id, sdb } = await get(opts.sid)
+  const { drive } = sdb
+
+  const on = {
+    style: inject,
+    commands: oncommands,
+    icons: iconject
+  }
+
+  const el = document.createElement('div')
+  const shadow = el.attachShadow({ mode: 'closed' })
+  shadow.innerHTML = `
+  <div class="console-history-container main">
+    <div class="console-menu">
+      <div class="commands-list"></div>
+    </div>
+    <div class="console-search">
+      <span class="console-search-icon"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="7" cy="7" r="5" stroke="currentColor" stroke-width="1.5"/><path d="M11 11L14 14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></span>
+      <input class="console-search-input" type="text" placeholder="search input" />
+      <button class="console-search-btn console-search-clear" title="Clear search"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M4 4L12 12M12 4L4 12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button>
+      <button class="console-search-btn console-search-filter" title="Toggle default (demo) entries"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M2 3H14L9.5 8.5V13L6.5 11.5V8.5L2 3Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg></button>
+    </div>
+  </div>`
+  const sheet = new CSSStyleSheet()
+  shadow.adoptedStyleSheets = [sheet]
+  const commands_list = shadow.querySelector('.commands-list')
+  const search_input = shadow.querySelector('.console-search-input')
+  const clear_btn = shadow.querySelector('.console-search-clear')
+  const filter_btn = shadow.querySelector('.console-search-filter')
+  search_input.oninput = on_search_input
+  clear_btn.onclick = on_clear_search
+  filter_btn.onclick = on_toggle_default_entries
+
+  let default_commands = []
+  const live_commands = []
+  let search_term = ''
+  let dricons = []
+  let docs_actions = []
+  const docs = DOCS(__filename)(opts.sid)
+  const debug = DEBUG(__filename)(opts.sid)
+  const { io, _ } = net(id)
+  debug.on_change(on_debug_change)
+
+  // Register actions with DOCS system
+  const actions_file = await drive.get('actions/commands.json')
+  if (actions_file.raw) {
+    docs_actions = typeof actions_file.raw === 'string' ? JSON.parse(actions_file.raw) : actions_file.raw
+    docs.register_actions(docs_actions)
+  } else {
+    console.error('actions.json not found')
+  }
+
+  await sdb.watch(onbatch)
+  io.on = {
+    up: io_up()
+  }
+  if (invite) io.accept(invite)
+  return el
+
+  function io_up () {
+    const on_message = {
+      record_closed_tab: handle_record_closed_tab
+    }
+    return function onmessage (msg) {
+      const handler = on_message[msg.type] || onmessage_fail
+      handler(msg)
+    }
+    function handle_record_closed_tab (msg) { record_closed_tab(msg.data) }
+    function onmessage_fail (msg) { console.warn('console_history: unknown message', { cause: msg && msg.type }) }
+  }
+
+  function record_closed_tab (data) {
+    const tab = data || {}
+    const entry = {
+      icon_type: 'file',
+      name_path: tab.name || tab.id || 'Tab',
+      label: 'closed',
+      pending: true,
+      status: null,
+      restore_data: { id: tab.id, name: tab.name }
+    }
+    live_commands.unshift(entry)
+    render_commands()
+  }
+
+  function resolve_closed_tab (entry, status, do_restore) {
+    entry.pending = false
+    entry.status = status
+    entry.label = status
+    if (do_restore) _.up('restore_tab', {}, entry.restore_data || { name: entry.name_path })
+    render_commands()
+  }
+
+  function on_search_input (e) {
+    search_term = e.target.value
+    render_commands()
+  }
+
+  function on_clear_search () {
+    search_term = ''
+    search_input.value = ''
+    render_commands()
+  }
+
+  function on_toggle_default_entries () {
+    debug.set_flag('show_default_entries', !debug.get_flag('show_default_entries'))
+  }
+
+  function on_debug_change () { render_commands() }
+
+  function create_command_item (command_data, action) {
+    const command_el = document.createElement('div')
+    command_el.className = 'command-item'
+
+    const icon_html = dricons[command_data.icon_type] || dricons.file || ''
+    const is_pending = !!command_data.pending
+    const status = command_data.status
+
+    let right_html = ''
+    if (is_pending) {
+      right_html =
+        '<div class="action-icon restore-action" title="Restore">' + (dricons.restore || '') + '</div>' +
+        '<div class="action-icon delete-action" title="Delete">' + (dricons.delete || '') + '</div>'
+    } else if (status) {
+      const status_class = String(status).toLowerCase().indexOf('delet') === 0 ? 'deleted' : 'restored'
+      right_html = '<span class="status-text status-' + status_class + '">' + status + '</span>'
+    }
+
+    command_el.innerHTML = `
+    <div class="command-content">
+      <div class="command-icon">${icon_html}</div>
+      <div class="command-info">
+        <div class="command-name">${command_data.name_path}</div>
+        <div class="command-label">${command_data.label || ''}</div>
+      </div>
+      ${right_html ? `<div class="command-actions">${right_html}</div>` : ''}
+    </div>`
+
+    on_command_click.info = action.info
+    on_command_click.opts = { state: { action: action.name } }
+    command_el.onclick = docs.wrap_isolated(on_command_click)
+
+    const restore_el = command_el.querySelector('.restore-action')
+    const delete_el = command_el.querySelector('.delete-action')
+    if (restore_el) restore_el.onclick = on_restore_click
+    if (delete_el) delete_el.onclick = on_delete_click
+
+    function on_restore_click (e) {
+      e.stopPropagation()
+      resolve_closed_tab(command_data, 'Restored', true)
+    }
+
+    function on_delete_click (e) {
+      e.stopPropagation()
+      resolve_closed_tab(command_data, 'Deleted', false)
+    }
+
+    function on_command_click (event, $) { $($.state.action) }
+
+    return command_el
+  }
+  function render_commands () {
+    commands_list.replaceChildren()
+    const show_defaults = debug.get_flag('show_default_entries')
+    const base = show_defaults ? live_commands.concat(default_commands) : live_commands.slice()
+    const term = search_term.trim().toLowerCase()
+    const visible = term ? base.filter(matches_search) : base
+    const actions = visible.map(create_command_action)
+    docs.register_actions(docs_actions.concat(actions))
+    visible.forEach(append_command_item)
+
+    function matches_search (command) {
+      const haystack = [command.name_path, command.label, command.status]
+        .filter(Boolean)
+        .join(' ')
+        .toLowerCase()
+      return haystack.includes(term)
+    }
+
+    function create_command_action (command, index) {
+      const name = 'Select History Entry ' + (index + 1)
+      return create_action(name, 'Select ' + command.name_path + ' in command history.', select_command)
+
+      function select_command () {
+        const command_el = commands_list.children[index]
+        const previous = commands_list.querySelector('.command-item.selected')
+        if (previous) previous.classList.remove('selected')
+        command_el.classList.add('selected')
+        _.up('ui_focus', {}, { type: 'command_history', sid: opts.sid })
+        _.up('command_clicked', {}, command)
+      }
+    }
+
+    function append_command_item (command, index) {
+      commands_list.appendChild(create_command_item(command, actions[index]))
+    }
+  }
+  function create_action (name, info, run) {
+    return { name, info, icon: 'history', status: { hidden: true }, steps: [], run }
+  }
+
+  async function onbatch (batch) {
+    for (const { type, paths } of batch) {
+      const data = await Promise.all(paths.map(load_path_raw))
+      const func = on[type] || fail
+      func(data, type)
+    }
+    render_commands()
+
+    function load_path_raw (path) { return drive.get(path).then(read_drive_file_raw) }
+    function read_drive_file_raw (file) { return file.raw }
+  }
+
+  function fail (data, type) { console.warn('invalid message', { cause: { data, type } }) }
+
+  function inject (data) { sheet.replaceSync(data[0]) }
+  function oncommands (data) {
+    const commands_data = typeof data[0] === 'string' ? JSON.parse(data[0]) : data[0]
+    default_commands = Array.isArray(commands_data) ? commands_data.map(normalize_default) : []
+  }
+
+  function normalize_default (entry) {
+    return {
+      icon_type: entry.icon_type || 'file',
+      name_path: entry.name_path || entry.name || 'entry',
+      label: entry.label || entry.status || entry.command || '',
+      pending: !!entry.pending,
+      status: entry.pending ? null : (entry.status || null),
+      restore_data: entry.restore_data || { name: entry.name_path }
+    }
+  }
+
+  function iconject (data) {
+    dricons = {
+      file: data[0] || '',
+      bulb: data[1] || '',
+      restore: data[2] || '',
+      delete: data[3] || ''
+    }
+  }
+}
+
+function fallback_module () {
+  return {
+    api: fallback_instance,
+    _: {
+      DOCS: {
+        $: ''
+      },
+      DEBUG: {
+        $: ''
+      },
+      net_helper: {
+        $: ''
+      }
+    }
+  }
+
+  function fallback_instance () {
+    return {
+      _: {
+        DOCS: {
+          0: ''
+        },
+        DEBUG: {
+          0: ''
+        },
+        net_helper: {
+          0: ''
+        }
+      },
+      drive: {
+        'commands/': {
+          'list.json': {
+            $ref: 'commands.json'
+          }
+        },
+        'actions/': {
+          'commands.json': {
+            raw: JSON.stringify([
+              {
+                name: 'Clear History',
+                info: 'Clear the stored console history after confirmation.',
+                icon: 'trash',
+                status: {
+                  pinned: false,
+                  default: true
+                },
+                steps: [
+                  { name: 'Confirm Clear', type: 'mandatory', is_completed: false, component: 'form_input', status: 'default', data: '' }
+                ]
+              },
+              {
+                name: 'Export History',
+                info: 'Export console history to the selected format and location.',
+                icon: 'download',
+                status: {
+                  pinned: true,
+                  default: false
+                },
+                steps: [
+                  { name: 'Choose Format', type: 'mandatory', is_completed: false, component: 'form_input', status: 'default', data: '' },
+                  { name: 'Select Location', type: 'mandatory', is_completed: false, component: 'form_input', status: 'default', data: '' }
+                ]
+              },
+              {
+                name: 'Search History',
+                info: 'Search through recorded console history entries.',
+                icon: 'search',
+                status: {
+                  pinned: false,
+                  default: true
+                },
+                steps: [
+                  { name: 'Enter Search Term', type: 'mandatory', is_completed: false, component: 'form_input', status: 'default', data: '' }
+                ]
+              }
+            ])
+          }
+        },
+        'icons/': {
+          'file.svg': {
+            raw: `<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M9.5 1H3.5C3.10218 1 2.72064 1.15804 2.43934 1.43934C2.15804 1.72064 2 2.10218 2 2.5V13.5C2 13.8978 2.15804 14.2794 2.43934 14.5607C2.72064 14.8420 3.10218 15 3.5 15H12.5C12.8978 15 13.2794 14.8420 13.5607 14.5607C13.8420 14.2794 14 13.8978 14 13.5V5.5L9.5 1Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M9.5 1V5.5H14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>`
+          },
+          'bulb.svg': {
+            raw: `<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M8 1C6.4087 1 4.88258 1.63214 3.75736 2.75736C2.63214 3.88258 2 5.4087 2 7C2 8.5913 2.63214 10.1174 3.75736 11.2426C4.88258 12.3679 6.4087 13 8 13C9.5913 13 11.1174 12.3679 12.2426 11.2426C13.3679 10.1174 14 8.5913 14 7C14 5.4087 13.3679 3.88258 12.2426 2.75736C11.1174 1.63214 9.5913 1 8 1Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M6.5 14H9.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>`
+          },
+          'restore.svg': {
+            raw: `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-arrow-counterclockwise" viewBox="0 0 16 16">
+              <path fill-rule="evenodd" d="M8 3a5 5 0 1 1-4.546 2.914.5.5 0 0 0-.908-.417A6 6 0 1 0 8 2v1z"/>
+              <path d="M8 4.466V.534a.25.25 0 0 0-.41-.192L5.23 2.308a.25.25 0 0 0 0 .384l2.36 1.966A.25.25 0 0 0 8 4.466z"/>
+            </svg>`
+          },
+          'delete.svg': {
+            raw: `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-trash3" viewBox="0 0 16 16">
+              <path d="M6.5 1h3a.5.5 0 0 1 .5.5v1H6v-1a.5.5 0 0 1 .5-.5ZM11 2.5v-1A1.5 1.5 0 0 0 9.5 0h-3A1.5 1.5 0 0 0 5 1.5v1H2.506a.58.58 0 0 0-.01 0H1.5a.5.5 0 0 0 0 1h.538l.853 10.66A2 2 0 0 0 4.885 16h6.23a2 2 0 0 0 1.994-1.84l.853-10.66h.538a.5.5 0 0 0 0-1h-.995a.59.59 0 0 0-.01 0H11Zm1.958 1-.846 10.58a1 1 0 0 1-.997.92H4.885a1 1 0 0 1-.997-.92L3.042 3.5h9.916Zm-7.487 1a.5.5 0 0 1 .528.47l.5 8.5a.5.5 0 0 1-.998.06L5 5.03a.5.5 0 0 1 .47-.528ZM8 4.5a.5.5 0 0 1 .5.5v8.5a.5.5 0 0 1-1 0V5a.5.5 0 0 1 .5-.5Zm2.522.47a.5.5 0 0 1 .528.47l-.5 8.5a.5.5 0 1 1-.998-.06l.5-8.5a.5.5 0 0 1 .47-.528Z"/>
+            </svg>`
+          }
+        },
+        'docs/': {
+          'README.md': {
+            $ref: 'README.md'
+          }
+        },
+        'style/': {
+          'theme.css': {
+            raw: `
+              .console-history-container {
+                display: flex;
+                flex-direction: column;
+                flex: 1 1 auto;
+                width: 100%;
+                height: 100%;
+                background: #202124;
+                border: 1px solid #3c3c3c;
+                box-sizing: border-box;
+                box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+                z-index: 1;
+                overflow: hidden;
+                color: #e8eaed;
+              }
+
+              .console-menu {
+                flex: 1 1 auto;
+                min-height: 0;
+                overflow-y: auto;
+                padding: 0px;
+              }
+
+              /* Sticky search bar pinned to the bottom; scrolling the list above
+                 it does not move it. */
+              .console-search {
+                flex: 0 0 auto;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                padding: 8px 12px;
+                background: #18191b;
+                border-top: 1px solid #3c3c3c;
+              }
+
+              .console-search-icon {
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                color: #969ba1;
+                flex: 0 0 auto;
+              }
+
+              .console-search-input {
+                flex: 1 1 auto;
+                min-width: 0;
+                box-sizing: border-box;
+                padding: 6px 8px;
+                background: transparent;
+                color: #e8eaed;
+                border: none;
+                outline: none;
+                font-size: 13px;
+              }
+
+              .console-search-input::placeholder { color: #6b7077; }
+
+              .console-search-btn {
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                width: 26px;
+                height: 26px;
+                padding: 0;
+                background: transparent;
+                border: none;
+                color: #969ba1;
+                cursor: pointer;
+                border-radius: 4px;
+              }
+
+              .console-search-btn:hover {
+                color: #e8eaed;
+                background: rgba(255, 255, 255, 0.08);
+              }
+
+              .commands-list {
+                display: flex;
+                flex-direction: column;
+                gap: 0px;
+              }
+
+              .command-item {
+                display: flex;
+                align-items: center;
+                padding: 8px 14px;
+                background: transparent;
+                border-bottom: 1px solid #3c3c3c;
+                cursor: pointer;
+                transition: background-color 0.15s ease;
+              }
+
+              .command-item:last-child {
+                border-bottom: none;
+              }
+
+              .command-item:hover {
+                background: #282a2d;
+              }
+
+              .command-item.selected {
+                background: #f56300;
+              }
+
+              .command-item.selected .command-name,
+              .command-item.selected .command-label,
+              .command-item.selected .status-text,
+              .command-item.selected .action-icon {
+                color: #fff;
+              }
+
+              .command-content {
+                display: flex;
+                align-items: center;
+                width: 100%;
+                gap: 12px;
+              }
+
+              .command-icon {
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                width: 28px;
+                height: 28px;
+                border-radius: 6px;
+                background: #2b2c2f;
+                color: #c8ccd2;
+                flex: 0 0 auto;
+              }
+
+              .command-item.selected .command-icon {
+                background: rgba(255, 255, 255, 0.18);
+                color: #fff;
+              }
+
+              .command-icon svg {
+                width: 16px;
+                height: 16px;
+              }
+
+              .command-info {
+                display: flex;
+                flex-direction: column;
+                gap: 2px;
+                min-width: 0;
+                flex: 1 1 auto;
+              }
+
+              .command-label {
+                font-size: 11px;
+                color: #969ba1;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+              }
+
+              .status-text {
+                font-size: 12px;
+                white-space: nowrap;
+              }
+
+              .status-text.status-restored { color: #46c95d; }
+              .status-text.status-deleted { color: #ff6b6b; }
+
+              .console-menu::-webkit-scrollbar {
+                width: 10px;
+              }
+              .console-menu::-webkit-scrollbar-track {
+                background: transparent;
+              }
+              .console-menu::-webkit-scrollbar-thumb {
+                background: #30363d;
+                border-radius: 999px;
+                background-clip: content-box;
+                border: 2px solid transparent;
+              }
+              .console-menu::-webkit-scrollbar-thumb:hover {
+                background: #484f58;
+              }
+              .console-menu {
+                scrollbar-width: thin;
+                scrollbar-color: #30363d transparent;
+              }
+              .command-name {
+                font-size: 13px;
+                font-weight: 400;
+                color: #e8eaed;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+              }
+
+              .command-path {
+                font-size: 13px;
+                color: #969ba1;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+              }
+              
+              .command-separator {
+                color: #969ba1;
+                margin: 0 4px;
+                font-size: 13px;
+              }
+
+              .linked-info {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                flex-grow: 1; /* Allow info to take available space */
+
+              }
+
+              .linked-icon {
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                width: 16px;
+                height: 16px;
+                color: #fbbc04; 
+              }
+
+              .linked-icon svg {
+                width: 14px;
+                height: 14px;
+              }
+
+              .linked-name {
+                font-size: 13px;
+                color: #fbbc04;
+                font-weight: 400;
+                white-space: nowrap;
+              }
+
+              .command-actions {
+                display: flex;
+                align-items: center;
+                gap: 10px; /* Adjusted gap */
+                margin-left: auto; /* Pushes actions to the right */
+              }
+
+              .action-text {
+                font-size: 13px;
+                color: #969ba1;
+                white-space: nowrap;
+              }
+
+              .action-icon {
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                width: 20px;
+                height: 20px;
+                color: #969ba1;
+                cursor: pointer;
+              }
+
+              .action-icon:hover {
+                color: #e8eaed;
+              }
+
+              .action-icon svg {
+                width: 16px;
+                height: 16px;
+              }
+            `
+          }
+        }
+      }
+    }
+  }
+}
+
+}).call(this)}).call(this,"/node_modules/ui-components/src/node_modules/console_history/console_history.js")
+},{"DEBUG":5,"DOCS":6,"STATE":1,"net_helper":18}],11:[function(require,module,exports){
+(function (__filename){(function (){
+const STATE = require('STATE')
+const statedb = STATE(__filename)
+const { get } = statedb(fallback_module)
+const net = require('net_helper')
+
+module.exports = docs_window
+
+async function docs_window (opts, invite) {
+  const { id, sdb } = await get(opts.sid)
+  const { drive } = sdb
+
+  const on = {
+    style: inject
+  }
+
+  const { io, _ } = net(id)
+  io.on = {
+    up: io_up()
+  }
+  if (invite) io.accept(invite)
+
+  const el = document.createElement('div')
+  const shadow = el.attachShadow({ mode: 'closed' })
+  shadow.innerHTML = `
+  <div class="docs-window main">
+    <button class="close-btn">✕</button>
+    <div class="docs-content">
+      <pre class="docs-text">No documentation available</pre>
+    </div>
+  </div>`
+
+  const sheet = new CSSStyleSheet()
+  shadow.adoptedStyleSheets = [sheet]
+  const close_btn = shadow.querySelector('.close-btn')
+  const docs_text = shadow.querySelector('.docs-text')
+
+  close_btn.onclick = onclose
+
+  await sdb.watch(onbatch)
+
+  return el
+
+  function onclose () {
+    _.up('close_docs', {}, null)
+  }
+
+  function io_up () {
+    return function onmessage (msg) {
+      const { type, data } = msg
+      if (type === 'display_doc') {
+        display_content(data)
+      }
+    }
+  }
+
+  function display_content (data) {
+    const content = data.content || undefined
+    docs_text.textContent = content || 'No documentation available'
+  }
+
+  async function onbatch (batch) {
+    for (const { type, paths } of batch) {
+      const data = await Promise.all(paths.map(load_path_raw))
+      const func = on[type] || fail
+      func(data, type)
+    }
+
+    function load_path_raw (path) { return drive.get(path).then(read_drive_file_raw) }
+    function read_drive_file_raw (file) { return file.raw }
+  }
+
+  function fail (data, type) { console.warn('invalid message', { cause: { data, type } }) }
+
+  function inject (data) { sheet.replaceSync(data[0]) }
+}
+
+function fallback_module () {
+  return {
+    _: {
+      net_helper: {
+        $: ''
+      }
+    },
+    api: fallback_instance
+  }
+
+  function fallback_instance () {
+    return {
+      _: {
+        net_helper: {
+          0: ''
+        }
+      },
+      drive: {
+        'style/': {
+          'theme.css': {
+            raw: `
+              .docs-window {
+                position: relative;
+                background: #1e1e2e;
+                border: 1px solid #3c3c3c;
+                border-radius: 8px;
+                box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+                color: #e8eaed;
+                overflow: hidden;
+                display: flex;
+                justify-content: space-between;
+                flex-direction: row-reverse;
+                flex-wrap: nowrap;
+                align-items: flex-start;
+              }
+              .close-btn {
+                background: transparent;
+                border: none;
+                color: #a6a6a6;
+                cursor: pointer;
+                font-size: 16px;
+                padding: 4px 8px;
+                border-radius: 4px;
+                transition: background 0.2s, color 0.2s;
+              }
+              .close-btn:hover {
+                background: rgba(255, 255, 255, 0.1);
+                color: #e8eaed;
+              }
+              .docs-content {
+                padding: 16px;
+                max-height: 200px;
+                overflow-y: auto;
+              }
+              .docs-text {
+                font-size: 13px;
+                line-height: 1.6;
+                color: #c9d1d9;
+                margin: 0;
+                white-space: pre-wrap;
+                word-wrap: break-word;
+              }
+            `
+          }
+        }
+      }
+    }
+  }
+}
+
+}).call(this)}).call(this,"/node_modules/ui-components/src/node_modules/docs_window/docs_window.js")
+},{"STATE":1,"net_helper":18}],12:[function(require,module,exports){
+(function (__filename){(function (){
+const STATE = require('STATE')
+const statedb = STATE(__filename)
+const { get } = statedb(fallback_module)
+const DOCS = require('DOCS')
+const net = require('net_helper')
+
+module.exports = form_click_rate_test
+
+async function form_click_rate_test (opts, invite) {
+  const { id, sdb } = await get(opts.sid)
+  const { drive } = sdb
+
+  const on = {
+    style: inject,
+    data: ondata
+  }
+
+  const docs = DOCS(__filename)(opts.sid)
+  const { io, _ } = net(id)
+  const click_state = {
+    accessible: true,
+    step_index: 0,
+    count: 0,
+    start: 0,
+    complete: false
+  }
+  const milliseconds_action = {
+    name: 'Click Rate Result',
+    info: 'Calculate and submit the milliseconds taken to complete 10 clicks.',
+    icon: 'timer',
+    status: {
+      pinned: false,
+      default: false
+    },
+    steps: [],
+    run: run_milliseconds_action
+  }
+
+  const el = document.createElement('div')
+  const shadow = el.attachShadow({ mode: 'closed' })
+  shadow.innerHTML = `
+  <div class="click-rate-test">
+    <div class="title">Click Rate Test</div>
+    <button class="click-btn" type="button">
+      <span class="count">0</span>
+      <span class="label">clicks</span>
+    </button>
+    <div class="hint">Click as fast as you can. The 10th click completes the action.</div>
+    <div class="result"></div>
+  </div>
+  <style></style>
+  `
+  const style = shadow.querySelector('style')
+  const button = shadow.querySelector('.click-btn')
+  const count_el = shadow.querySelector('.count')
+  const result_el = shadow.querySelector('.result')
+
+  on_click.info = 'Record one click in the 10-click sequence. This event is not an action until the 10th click.'
+  on_click.opts = { state: click_state }
+  button.onclick = docs.wrap_isolated(on_click)
+  docs.register_actions([milliseconds_action])
+  docs.on_docs_mode_change(on_docs_mode_change)
+
+  await sdb.watch(onbatch)
+
+  const parent_handler = {
+    step_data,
+    reset_data
+  }
+
+  io.on = {
+    up: io_up()
+  }
+  if (invite) io.accept(invite)
+
+  return el
+
+  function io_up () {
+    return function onmessage ({ type, data }) {
+      const handler = parent_handler[type] || fail
+      handler(data, type)
+    }
+  }
+
+  async function onbatch (batch) {
+    for (const { type, paths } of batch) {
+      const data = await Promise.all(paths.map(load_path_raw))
+      const func = on[type] || fail
+      func(data, type)
+    }
+
+    function load_path_raw (path) { return drive.get(path).then(read_drive_file_raw) }
+    function read_drive_file_raw (file) { return file.raw }
+  }
+
+  function fail (data, type) { console.warn('invalid message', { cause: { data, type } }) }
+
+  function inject (data) {
+    style.replaceChildren(create_style_element())
+
+    function create_style_element () {
+      const style_el = document.createElement('style')
+      style_el.textContent = data[0]
+      return style_el
+    }
+  }
+
+  function ondata (data) {
+    if (data.length === 0 || !data[0]) return
+    const result = data[0].result || ''
+    click_state.count = result ? data[0].click_count || 10 : 0
+    click_state.start = 0
+    click_state.complete = Boolean(result)
+    update_count()
+    show_result(result)
+  }
+
+  function step_data (data) {
+    click_state.accessible = data.is_accessible !== false
+    click_state.step_index = data.index !== undefined ? data.index : 0
+    button.disabled = !click_state.accessible
+  }
+
+  function reset_data () {
+    reset_clicks()
+    drive.put('data/form_click_rate_test.json', {
+      click_count: 0,
+      result: ''
+    })
+  }
+
+  function on_docs_mode_change (active) {
+    if (!active) update_count()
+  }
+
+  function on_click (event, $) {
+    if (!$.state.accessible || $.state.complete) return
+    if ($.state.count === 0) $.state.start = Date.now()
+
+    $.state.count += 1
+    event.currentTarget.querySelector('.count').textContent = $.state.count
+
+    if ($.state.count === 10) {
+      $.state.complete = true
+      $('click_rate_result')
+    }
+  }
+
+  async function run_milliseconds_action () {
+    const result = '10 clicks in ' + (Date.now() - click_state.start) + ' ms'
+    show_result(result)
+    await drive.put('data/form_click_rate_test.json', {
+      click_count: click_state.count,
+      result
+    })
+    _.up('action_submitted', {}, { value: result, index: click_state.step_index })
+    _.up('action_complete', {}, { value: result })
+    return result
+  }
+
+  function reset_clicks () {
+    click_state.count = 0
+    click_state.start = 0
+    click_state.complete = false
+    result_el.textContent = ''
+    update_count()
+  }
+
+  function update_count () { count_el.textContent = click_state.count }
+  function show_result (result) { result_el.textContent = result }
+}
+
+function fallback_module () {
+  return {
+    api: fallback_instance,
+    _: {
+      DOCS: { $: '' },
+      net_helper: { $: '' }
+    }
+  }
+
+  function fallback_instance () {
+    return {
+      _: {
+        DOCS: { 0: '' },
+        net_helper: { 0: '' }
+      },
+      drive: {
+        'style/': {
+          'form_click_rate_test.css': { $ref: 'form_click_rate_test.css' }
+        },
+        'data/': {
+          'form_click_rate_test.json': { raw: { click_count: 0, result: '' } }
+        },
+        'docs/': { 'README.md': { raw: '# Click Rate Test\nClick 10 times as fast as possible.' } }
+      }
+    }
+  }
+}
+
+}).call(this)}).call(this,"/node_modules/ui-components/src/node_modules/form_click_rate_test/form_click_rate_test.js")
+},{"DOCS":6,"STATE":1,"net_helper":18}],13:[function(require,module,exports){
+(function (__filename){(function (){
+const STATE = require('STATE')
+const statedb = STATE(__filename)
+const { get } = statedb(fallback_module)
+// const DOCS = require('DOCS')
+const net = require('net_helper')
+
+module.exports = form_input
+async function form_input (opts, invite) {
+  const { id, sdb } = await get(opts.sid)
+  const { drive } = sdb
+
+  const on = {
+    style: inject,
+    data: ondata
+  }
+
+  let current_step = null
+  let input_accessible = true
+
+  const { io, _ } = net(id)
+  io.on = {
+    up: io_up()
+  }
+  if (invite) io.accept(invite)
+
+  const el = document.createElement('div')
+  const shadow = el.attachShadow({ mode: 'closed' })
+  shadow.innerHTML = `
+  <div class="input-display">
+    <div class='test'>
+      <input class="input-field" type="text" placeholder="Type to submit">
+    </div>
+    <div class="overlay-lock" hidden></div>
+  </div>`
+  const sheet = new CSSStyleSheet()
+  shadow.adoptedStyleSheets = [sheet]
+
+  const input_field_el = shadow.querySelector('.input-field')
+  const overlay_el = shadow.querySelector('.overlay-lock')
+
+  input_field_el.oninput = on_input_field_input
+
+  async function on_input_field_input () {
+    if (!input_accessible) return
+    await drive.put('data/form_input.json', {
+      input_field: input_field_el.value
+    })
+    if (input_field_el.value.length >= 10) {
+      _.up('action_submitted', {}, {
+        value: input_field_el.value,
+        index: current_step.index !== undefined ? current_step.index : 0
+      })
+      console.log('mark_as_complete')
+    } else {
+      _.up('action_incomplete', {}, {
+        value: input_field_el.value,
+        index: current_step.index !== undefined ? current_step.index : 0
+      })
+    }
+  }
+
+  await sdb.watch(onbatch)
+  const parent_handler = {
+    step_data,
+    reset_data
+  }
+
+  return el
+
+  async function onbatch (batch) {
+    for (const { type, paths } of batch) {
+      const data = await Promise.all(paths.map(load_path_raw))
+      const func = on[type] || fail
+      func(data, type)
+    }
+
+    function load_path_raw (path) { return drive.get(path).then(read_drive_file_raw) }
+    function read_drive_file_raw (file) { return file.raw }
+  }
+
+  function fail (data, type) { console.warn('invalid message', { cause: { data, type } }) }
+
+  function inject (data) { sheet.replaceSync(data[0]) }
+
+  function ondata (data) {
+    if (data.length > 0) {
+      const input_data = data[0]
+      if (input_data.input_field) {
+        input_field_el.value = input_data.input_field
+      }
+    } else {
+      input_field_el.value = ''
+    }
+  }
+
+  function io_up () {
+    return function onmessage ({ type, data }) {
+      console.log('message from form_input', type, data)
+      const handler = parent_handler[type] || fail
+      handler(data, type)
+    }
+  }
+
+  function step_data (data, type) {
+    current_step = data
+    input_field_el.value = data?.data
+
+    input_accessible = data.is_accessible !== false
+
+    overlay_el.hidden = input_accessible
+
+    input_field_el.placeholder = input_accessible
+      ? 'Type to submit'
+      : 'Input disabled for this step'
+  }
+
+  function reset_data (data, type) {
+    input_field_el.value = ''
+    drive.put('data/form_input.json', {
+      input_field: ''
+    })
+  }
+}
+function fallback_module () {
+  return {
+    api: fallback_instance,
+    _: {
+      net_helper: {
+        $: ''
+      }
+      // DOCS: {
+      //   $: ''
+      // },
+    }
+  }
+  function fallback_instance () {
+    return {
+      _: {
+        net_helper: {
+          0: ''
+        }
+        // DOCS: {
+        //   0: ''
+        // },
+      },
+      drive: {
+        'style/': {
+          'theme.css': {
+            raw: `
+            .input-display {
+              background: #131315;
+              border-radius: 16px;
+              border: 1px solid #3c3c3c;
+              display: flex;
+              flex: 1;
+              align-items: center;
+              padding: 0 12px;
+              min-height: 32px;
+              position: relative;
+            }
+            .input-display:focus-within {
+              border-color: #4285f4;
+              background: #1a1a1c;
+            }
+            .input-field {
+              flex: 1;
+              min-height: 32px;
+              background: transparent;
+              border: none;
+              color: #e8eaed;
+              padding: 0 12px;
+              font-size: 14px;
+              outline: none;
+            }
+            .input-field::placeholder {
+              color: #a6a6a6;
+            }
+            .overlay-lock {
+              position: absolute;
+              inset: 0;
+              background: transparent;
+              z-index: 10;
+              cursor: not-allowed;
+            }`
+          }
+        },
+        'data/': {
+          'form_input.json': {
+            raw: {
+              input_field: ''
+            }
+          }
+        },
+        'docs/': {
+          'README.md': {
+            $ref: 'README.md'
+          }
+        }
+      }
+    }
+  }
+}
+
+}).call(this)}).call(this,"/node_modules/ui-components/src/node_modules/form_input/form_input.js")
+},{"STATE":1,"net_helper":18}],14:[function(require,module,exports){
+(function (__filename){(function (){
+const STATE = require('STATE')
+const statedb = STATE(__filename)
+const { get } = statedb(fallback_module)
+// const DOCS = require('DOCS')
+const net = require('net_helper')
+
+module.exports = form_tile_split_choice
+async function form_tile_split_choice (opts, invite) {
+  const { id, sdb } = await get(opts.sid)
+  const { drive } = sdb
+
+  const on = {
+    style: inject,
+    data: ondata
+  }
+
+  let current_step = null
+  const { io, _ } = net(id)
+
+  const el = document.createElement('div')
+  const shadow = el.attachShadow({ mode: 'closed' })
+  shadow.innerHTML = `
+  <div class="tile-split-chooser">
+    <div class="title">Split Tile</div>
+    <div class="choices">
+      <button class="choice-btn" data-choice="up">
+        <span class="arrow up"></span>
+        <span class="label">Up</span>
+      </button>
+      <button class="choice-btn" data-choice="left">
+        <span class="arrow left"></span>
+        <span class="label">Left</span>
+      </button>
+      <button class="choice-btn" data-choice="right">
+        <span class="arrow right"></span>
+        <span class="label">Right</span>
+      </button>
+      <button class="choice-btn" data-choice="down">
+        <span class="arrow down"></span>
+        <span class="label">Down</span>
+      </button>
+    </div>
+    <div class="hint">Choose direction to split the tile</div>
+  </div>
+  <style></style>
+  `
+  const style = shadow.querySelector('style')
+  const buttons = Array.from(shadow.querySelectorAll('.choice-btn'))
+
+  buttons.forEach(btn => btn.addEventListener('click', on_choice_click))
+
+  await sdb.watch(onbatch)
+
+  const parent_handler = {
+    step_data,
+    reset_data
+  }
+
+  io.on = {
+    up: io_up()
+  }
+  if (invite) io.accept(invite)
+
+  return el
+
+  function io_up () {
+    return function onmessage ({ type, data }) {
+      const handler = parent_handler[type] || fail
+      handler(data, type)
+    }
+  }
+
+  async function onbatch (batch) {
+    for (const { type, paths } of batch) {
+      const data = await Promise.all(paths.map(load_path_raw))
+      const func = on[type] || fail
+      func(data, type)
+    }
+
+    function load_path_raw (path) { return drive.get(path).then(read_drive_file_raw) }
+    function read_drive_file_raw (file) { return file.raw }
+  }
+
+  function fail (data, type) { console.warn('invalid message', { cause: { data, type } }) }
+
+  function inject (data) {
+    style.replaceChildren(create_style_element())
+
+    function create_style_element () {
+      const style_el = document.createElement('style')
+      style_el.textContent = data[0]
+      return style_el
+    }
+  }
+
+  function ondata (data) {
+    // support persisted/default choice if present
+    if (data.length > 0 && data[0] && data[0].choice) {
+      highlight_choice(String(data[0].choice))
+    }
+  }
+
+  function step_data (data) {
+    current_step = data
+  }
+
+  function reset_data () {
+    // nothing for now
+  }
+
+  async function on_choice_click (ev) {
+    const choice = ev.currentTarget.getAttribute('data-choice')
+    await drive.put('data/form_tile_split_choice.json', { choice })
+    highlight_choice(choice)
+    _.up('action_submitted', {}, { value: choice, index: current_step?.index ?? 0 })
+
+    // If this is a single-step action, auto-complete the action
+    if (current_step && current_step.total_steps === 1) {
+      _.up('action_complete', {}, { value: choice })
+    }
+  }
+
+  function highlight_choice (choice) {
+    buttons.forEach(b => {
+      const isActive = b.getAttribute('data-choice') === choice
+      b.classList.toggle('active', isActive)
+      b.setAttribute('aria-pressed', isActive ? 'true' : 'false')
+      if (isActive) {
+        b.style.background = 'linear-gradient(180deg, rgba(103,195,255,0.06), rgba(103,195,255,0.02))'
+        b.style.boxShadow = '0 12px 36px rgba(103,195,255,0.16)'
+        b.style.borderColor = 'rgba(103,195,255,0.36)'
+        b.style.transform = 'translateY(-2px) scale(1.01)'
+      } else {
+        b.style.background = ''
+        b.style.boxShadow = ''
+        b.style.borderColor = ''
+        b.style.transform = ''
+      }
+    })
+  }
+}
+
+function fallback_module () {
+  return {
+    api: fallback_instance,
+    _: {
+      net_helper: { $: '' }
+      // DOCS: { $: '' },
+    }
+  }
+
+  function fallback_instance () {
+    return {
+      _: {
+        net_helper: { 0: '' }
+        // DOCS: { 0: '' },
+      },
+      drive: {
+        'style/': {
+          'form_tile_split_choice.css': { $ref: 'form_tile_split_choice.css' }
+        },
+        'data/': {
+          'form_tile_split_choice.json': { raw: { choice: null } }
+        },
+        'docs/': { 'README.md': { $ref: 'README.md' } }
+      }
+    }
+  }
+}
+
+}).call(this)}).call(this,"/node_modules/ui-components/src/node_modules/form_tile_split_choice/form_tile_split_choice.js")
+},{"STATE":1,"net_helper":18}],15:[function(require,module,exports){
+(function (__filename){(function (){
+const STATE = require('STATE')
+const statedb = STATE(__filename)
+const { get } = statedb(fallback_module)
+const net = require('net_helper')
+const graph_explorer = require('graph-explorer')
+const graphdb = require('./graphdb')
+
+module.exports = graph_viewer
+
+async function graph_viewer (opts, invite) {
+  const { id, sdb } = await get(opts.sid)
+  const { drive } = sdb
+
+  let db = null
+  let latest_entries = null
+  let graph_explorer_connected = false
+
+  // Protocol
+  const { io, _ } = net(id)
+  io.on = {
+    up: io_up(),
+    graph_explorer: io_graph_explorer()
+  }
+  if (invite) io.accept(invite)
+
+  const on = {
+    theme: inject,
+    entries: on_entries
+  }
+
+  const el = document.createElement('div')
+  const shadow = el.attachShadow({ mode: 'closed' })
+
+  const sheet = new CSSStyleSheet()
+  shadow.adoptedStyleSheets = [sheet]
+
+  const subs = await sdb.watch(onbatch)
+
+  const explorer_el = await graph_explorer(subs[0], io.invite('graph_explorer', { storage: id }))
+  graph_explorer_connected = true
+  if (latest_entries) _.graph_explorer('db_initialized', {}, { entries: latest_entries })
+  shadow.append(explorer_el)
+
+  return el
+
+  function io_up () {
+    const parent_handlers = {
+      execute_step: parent_execute_step,
+      set_mode: parent_forward_to_graph_explorer,
+      set_search_query: parent_forward_to_graph_explorer,
+      select_nodes: parent_forward_to_graph_explorer,
+      expand_node: parent_forward_to_graph_explorer,
+      collapse_node: parent_forward_to_graph_explorer,
+      toggle_node: parent_forward_to_graph_explorer,
+      get_selected: parent_forward_to_graph_explorer,
+      get_confirmed: parent_forward_to_graph_explorer,
+      clear_selection: parent_forward_to_graph_explorer,
+      set_flag: parent_forward_to_graph_explorer,
+      scroll_to_node: parent_forward_to_graph_explorer,
+      docs_toggle: parent_forward_to_graph_explorer
+    }
+    return function onmessage (msg) {
+      const handler = parent_handlers[msg.type] || fail
+      handler(msg)
+    }
+  }
+
+  function parent_execute_step (msg) {
+    const commands = get_step_commands(msg.data)
+    for (const command of commands) {
+      const refs = msg.head ? { cause: msg.head } : {}
+      const data = command.data !== undefined ? command.data : {}
+      _.graph_explorer(command.type, refs, data)
+    }
+  }
+
+  function parent_forward_to_graph_explorer (msg) {
+    const refs = msg.head ? { cause: msg.head } : {}
+    _.graph_explorer(msg.type, refs, msg.data)
+  }
+
+  function get_step_commands (data) {
+    if (!data) return []
+    if (Array.isArray(data.commands)) return data.commands.filter(has_command_type)
+    if (data.command && has_command_type(data.command)) return [data.command]
+    if (has_command_type(data)) {
+      return [{ type: data.type, data: data.data !== undefined ? data.data : {} }]
+    }
+    return []
+
+    function has_command_type (command) {
+      return command && typeof command.type === 'string' && command.type.length > 0
+    }
+  }
+
+  async function onbatch (batch) {
+    for (const { type, paths } of batch) {
+      const data = await Promise.all(paths.map(load_path_raw))
+      const handler = on[type] || fail
+      handler({ data, type })
+    }
+
+    function load_path_raw (path) { return drive.get(path).then(read_drive_file_raw) }
+    function read_drive_file_raw (file) { return file.raw }
+  }
+
+  function fail ({ data, type }) { console.warn('invalid message', { cause: { data, type } }) }
+  function inject ({ data }) { sheet.replaceSync(data.join('\n')) }
+
+  function on_entries ({ data }) {
+    if (!data || !data[0]) {
+      console.error('Entries data is missing or empty.')
+      latest_entries = {}
+      db = graphdb({})
+      if (graph_explorer_connected) _.graph_explorer('db_initialized', {}, { entries: {} })
+      return
+    }
+
+    let parsed_data
+    try {
+      parsed_data = typeof data[0] === 'string' ? JSON.parse(data[0]) : data[0]
+    } catch (e) {
+      console.error('Failed to parse entries data:', e)
+      parsed_data = {}
+    }
+
+    if (typeof parsed_data !== 'object' || !parsed_data) {
+      console.error('Parsed entries data is not a valid object.')
+      parsed_data = {}
+    }
+
+    db = graphdb(parsed_data)
+    latest_entries = parsed_data
+    if (graph_explorer_connected) _.graph_explorer('db_initialized', {}, { entries: parsed_data })
+  }
+
+  // ---------------------------------------------------------
+  // PROTOCOL
+  // ---------------------------------------------------------
+
+  function io_graph_explorer () {
+    return function graph_explorer_protocol(msg) {
+      const { type } = msg
+      const db_handler = {
+        db_get: params => db.get(params.path),
+        db_has: params => db.has(params.path),
+        db_is_empty: () => db.is_empty(),
+        db_root: () => db.root(),
+        db_keys: () => db.keys(),
+        db_raw: () => db.raw()
+      }
+
+      if (type.startsWith('db_')) {
+        handle_db_request(msg)
+      } else {
+        _.up(msg.type, msg.head ? { cause: msg.head } : {}, msg.data)
+      }
+
+      function handle_db_request ({ head, type, data }) {
+        const handler = db ? db_handler[type] || db_fail : db_fail
+        _.graph_explorer('db_response', { cause: head }, { result: handler(data) })
+
+        function db_fail () {
+          const msg = db ? '[graph_viewer] Unknown db operation:' : '[graph_viewer] Database not initialized yet'
+          console.warn(msg, type)
+          return null
+        }
+      }
+    }
+  }
+}
+
+function fallback_module () {
+  return {
+    _: {
+      'graph-explorer': {
+        $: ''
+      },
+      './graphdb': {
+        $: ''
+      },
+      net_helper: {
+        $: ''
+      }
+    },
+    api: fallback_instance
+  }
+
+  function fallback_instance () {
+    return {
+      _: {
+        'graph-explorer': {
+          $: '',
+          0: '',
+          mapping: {
+            style: 'theme',
+            runtime: 'runtime',
+            mode: 'mode',
+            flags: 'flags',
+            keybinds: 'keybinds',
+            undo: 'undo',
+            docs: 'docs'
+          }
+        },
+        './graphdb': {
+          $: ''
+        },
+        net_helper: {
+          0: ''
+        }
+      },
+      drive: {
+        'theme/': {
+          'style.css': {
+            raw: `
+              :host {
+              display: block;
+              height: 100%;
+              width: 100%;
+              }
+            `
+          }
+        },
+        'entries/': {
+          'entries.json': {
+            $ref: 'entries.json'
+          }
+        },
+        'runtime/': {
+          'node_height.json': { raw: '16' },
+          'vertical_scroll_value.json': { raw: '0' },
+          'horizontal_scroll_value.json': { raw: '0' },
+          'selected_instance_paths.json': { raw: '[]' },
+          'confirmed_selected.json': { raw: '[]' },
+          'instance_states.json': { raw: '{}' },
+          'search_entry_states.json': { raw: '{}' },
+          'last_clicked_node.json': { raw: 'null' },
+          'view_order_tracking.json': { raw: '{}' }
+        },
+        'mode/': {
+          'current_mode.json': { raw: '"menubar"' },
+          'previous_mode.json': { raw: '"menubar"' },
+          'search_query.json': { raw: '""' },
+          'multi_select_enabled.json': { raw: 'false' },
+          'select_between_enabled.json': { raw: 'false' }
+        },
+        'flags/': {
+          'hubs.json': { raw: '"default"' },
+          'selection.json': { raw: 'true' },
+          'recursive_collapse.json': { raw: 'true' }
+        },
+        'keybinds/': {
+          'navigation.json': {
+            raw: JSON.stringify({
+              ArrowUp: 'navigate_up_current_node',
+              ArrowDown: 'navigate_down_current_node',
+              'Control+ArrowDown': 'toggle_subs_for_current_node',
+              'Control+ArrowUp': 'toggle_hubs_for_current_node',
+              'Alt+s': 'multiselect_current_node',
+              'Alt+b': 'select_between_current_node',
+              'Control+m': 'toggle_search_mode',
+              'Alt+j': 'jump_to_next_duplicate'
+            })
+          }
+        },
+        'undo/': {
+          'stack.json': { raw: '[]' }
+        },
+        'docs/': {
+          'README.md': {
+            $ref: 'README.md'
+          }
+        }
+      }
+    }
+  }
+}
+
+}).call(this)}).call(this,"/node_modules/ui-components/src/node_modules/graph_viewer/graph_viewer.js")
+},{"./graphdb":16,"STATE":1,"graph-explorer":2,"net_helper":18}],16:[function(require,module,exports){
+module.exports = graphdb
+
+function graphdb (entries) {
+  // Validate entries
+  if (!entries || typeof entries !== 'object') {
+    console.warn('[graphdb] Invalid entries provided, using empty object')
+    entries = {}
+  }
+
+  const api = {
+    get,
+    has,
+    keys,
+    is_empty,
+    root,
+    raw
+  }
+
+  return api
+
+  function get (path) { return entries[path] || null }
+  function has (path) { return path in entries }
+  function keys () { return Object.keys(entries) }
+  function is_empty () { return Object.keys(entries).length === 0 }
+  function root () { return entries['/'] || null }
+  function raw () { return entries }
+}
+
+},{}],17:[function(require,module,exports){
+(function (__filename){(function (){
+const STATE = require('STATE')
+const statedb = STATE(__filename)
+const { get } = statedb(fallback_module)
+// const DOCS = require('DOCS')
+const net = require('net_helper')
+
+module.exports = input_test
+async function input_test (opts, invite) {
+  const { id, sdb } = await get(opts.sid)
+  const { drive } = sdb
+
+  const on = {
+    style: inject,
+    data: ondata
+  }
+
+  let current_step = null
+  let input_accessible = true
+  const { io, _ } = net(id)
+  io.on = {
+    up: io_up()
+  }
+  if (invite) io.accept(invite)
+
+  const el = document.createElement('div')
+  const shadow = el.attachShadow({ mode: 'closed' })
+  shadow.innerHTML = `
+  <div class='title'> Testing 2nd Type </div>
+  <div class="input-display">
+    <input class="input-field" type="text" placeholder="Type to submit">
+    <div class="overlay-lock" hidden></div>
+  </div>`
+  const sheet = new CSSStyleSheet()
+  shadow.adoptedStyleSheets = [sheet]
+
+  const input_field_el = shadow.querySelector('.input-field')
+  const overlay_el = shadow.querySelector('.overlay-lock')
+
+  input_field_el.oninput = on_input_field_input
+
+  async function on_input_field_input () {
+    if (!input_accessible) return
+
+    await drive.put('data/input_test.json', {
+      input_field: input_field_el.value
+    })
+
+    if (input_field_el.value.length >= 10) {
+      _.up('action_submitted', {}, {
+        value: input_field_el.value,
+        index: current_step.index !== undefined ? current_step.index : 0
+      })
+      console.log('mark_as_complete')
+    } else {
+      _.up('action_incomplete', {}, {
+        value: input_field_el.value,
+        index: current_step.index !== undefined ? current_step.index : 0
+      })
+    }
+  }
+
+  await sdb.watch(onbatch)
+
+  const parent_handler = {
+    step_data,
+    reset_data
+  }
+
+  return el
+
+  async function onbatch (batch) {
+    for (const { type, paths } of batch) {
+      const data = await Promise.all(paths.map(load_path_raw))
+      const func = on[type] || fail
+      func(data, type)
+    }
+
+    function load_path_raw (path) { return drive.get(path).then(read_drive_file_raw) }
+    function read_drive_file_raw (file) { return file.raw }
+  }
+
+  function fail (data, type) { console.warn('invalid message', { cause: { data, type } }) }
+  function inject (data) { sheet.replaceSync(data[0]) }
+
+  function ondata (data) {
+    if (data.length > 0) {
+      const input_data = data[0]
+      if (input_data.input_field) {
+        input_field_el.value = input_data.input_field
+      }
+    } else {
+      input_field_el.value = ''
+    }
+  }
+
+  // ------------------
+  // Parent Observer
+  // ------------------
+
+  function io_up () {
+    return function onmessage ({ type, data }) {
+      console.log('message from input_test', type, data)
+      const handler = parent_handler[type] || fail
+      handler(data, type)
+    }
+  }
+
+  function step_data (data, type) {
+    current_step = data
+
+    input_accessible = data.is_accessible !== false
+
+    overlay_el.hidden = input_accessible
+
+    input_field_el.placeholder = input_accessible
+      ? 'Type to submit'
+      : 'Input disabled for this step'
+  }
+
+  function reset_data (data, type) {
+    input_field_el.value = ''
+    drive.put('data/input_test.json', {
+      input_field: ''
+    })
+  }
+}
+function fallback_module () {
+  return {
+    api: fallback_instance,
+    _: {
+      net_helper: {
+        $: ''
+      }
+      // DOCS: {
+      //   $: ''
+      // },
+    }
+  }
+  function fallback_instance () {
+    return {
+      _: {
+        net_helper: {
+          0: ''
+        }
+        // DOCS: {
+        //   0: ''
+        // },
+      },
+      drive: {
+        'style/': {
+          'theme.css': {
+            raw: `
+            .title {
+              color: #e8eaed;
+              font-size: 18px;
+              display: flex;
+              align-items: center;
+            }
+            .input-display {
+              position: relative;
+              background: #131315;
+              border-radius: 16px;
+              border: 1px solid #3c3c3c;
+              display: flex;
+              flex: 1;
+              align-items: center;
+              padding: 0 12px;
+              min-height: 32px;
+            }
+            .input-display:focus-within {
+              border-color: #4285f4;
+              background: #1a1a1c;
+            }
+            .input-field {
+              flex: 1;
+              min-height: 32px;
+              background: transparent;
+              border: none;
+              color: #e8eaed;
+              padding: 0 12px;
+              font-size: 14px;
+              outline: none;
+            }
+            .input-field::placeholder {
+              color: #a6a6a6;
+            }
+            .overlay-lock {
+              position: absolute;
+              inset: 0;
+              background: transparent;
+              z-index: 10;
+              cursor: not-allowed;
+            }`
+          }
+        },
+        'data/': {
+          'input_test.json': {
+            raw: {
+              input_field: ''
+            }
+          }
+        },
+        'docs/': {
+          'README.md': {
+            $ref: 'README.md'
+          }
+        }
+      }
+    }
+  }
+}
+
+}).call(this)}).call(this,"/node_modules/ui-components/src/node_modules/input_test/input_test.js")
+},{"STATE":1,"net_helper":18}],18:[function(require,module,exports){
+(function (__filename){(function (){
+module.exports = net
+
+function net (id) {
+  const [label, io, _, sub, hub] = [`[${id}@${__filename}]`, { invite, accept, on: {} }, {}, {}, {}]
+  return { io, _ }
+  function forward (to, M) {
+    if (to.startsWith(id)) {
+      const ups = [...new Set(Object.keys(hub).map(id => hub[id].tx))]
+      for (const tx of ups) tx(M)
+      return
+    }
+    for (const id of Object.keys(sub)) if (to.startsWith(id)) return sub[id].tx(M)
+    throw new Error(`${label} unknown recipient "${to}"`)
+  }
+  function invite (name, ids) {
+    if (!io.on[name]) throw new Error(`${label} no protocol handler for "${name}"`)
+    return Object.assign(invite, { ids })
+    function invite (tx) {
+      const rx = router(sub)
+      add(name, tx, tx.id, rx, sub)
+      return rx
+    }
+  }
+  function accept (invite) {
+    const rx = router(hub)
+    const tx = invite(Object.assign(rx, { id }))
+    for (const [name, to] of Object.entries(invite.ids)) {
+      if (hub[to]) throw new Error(`${label} already connected to "${to}"`)
+      if (!io.on[name]) throw new Error(`${label} no "${name}" protocol for "${to}"`)
+      add(name, tx, to, rx, hub)
+    }
+  }
+  function router ($) {
+    return function rx (M) {
+      const { head: [by, to] } = M
+      console.log(`[M]\n${by} \n to: \n ${to}`, M)
+      if (to !== id) return forward(to, M)
+      if (!$[by]) throw new Error(`${label} unknown sender "${by}"`)
+      const { name } = $[by].state
+      if (!io.on[name]) throw new Error(`${label} no "${name}" protocol for "${to}"`)
+      io.on[name](M)
+    }
+  }
+  function add (name, tx, to, rx, $) {
+    const state = { name, to, mid: 0 }
+    _[name] = send
+    $[to] = { rx, tx, state }
+    function send (type, refs = {}, data = null) {
+      const head = [id, to, state.mid++]
+      const meta = { time: Date.now(), stack: (new Error().stack) }
+      tx({ head, refs, type, data, meta })
+      return head
+    }
+  }
+}
+
+}).call(this)}).call(this,"/node_modules/ui-components/src/node_modules/net_helper/net_helper.js")
+},{}],19:[function(require,module,exports){
+(function (__filename){(function (){
+const STATE = require('STATE')
+const statedb = STATE(__filename)
+const { get } = statedb(fallback_module)
+const net = require('net_helper')
+
+const form_input = require('form_input')
+const input_test = require('input_test')
+const form_tile_split_choice = require('form_tile_split_choice')
+const form_click_rate_test = require('form_click_rate_test')
+
+program.form_input = form_input
+program.input_test = input_test
+program.form_tile_split_choice = form_tile_split_choice
+program.form_click_rate_test = form_click_rate_test
+
+module.exports = program
+
+async function program (opts, invite) {
+  const { id, sdb } = await get(opts.sid)
+  const { drive } = sdb
+
+  const on = {
+    style: inject,
+    variables: onvariables
+  }
+
+  const { io } = net(id)
+  io.on = {
+    up: io_up()
+  }
+  if (invite) io.accept(invite)
+
+  const el = document.createElement('div')
+  const shadow = el.attachShadow({ mode: 'closed' })
+  const sheet = new CSSStyleSheet()
+  shadow.adoptedStyleSheets = [sheet]
+
+  await sdb.watch(onbatch)
+
+  const parent_handler = {
+    display_result,
+    update_data
+  }
+
+  return el
+
+  // --- Internal Functions ---
+  async function onbatch (batch) {
+    for (const { type, paths } of batch) {
+      const data = await Promise.all(paths.map(load_path_raw))
+      const func = on[type] || fail
+      func(data, type)
+    }
+
+    function load_path_raw (path) { return drive.get(path).then(read_drive_file_raw) }
+    function read_drive_file_raw (file) { return file.raw }
+  }
+
+  function fail (data, type) { console.warn('invalid message', { cause: { data, type } }) }
+
+  function inject (data) { sheet.replaceSync(data[0]) }
+
+  function onvariables (data) {
+    // Dont get why we have this module.
+  }
+
+  function io_up () {
+    return function onmessage ({ type, data }) {
+      const handler = parent_handler[type] || fail
+      handler(data, type)
+    }
+  }
+  function display_result (data) {
+    console.log('Display Result:', data)
+    alert(`Result of action(${data.selected_action ? data.selected_action : 'unknown'}): ${data.result ? data.result : 'no result'}`)
+  }
+  function update_data (data) { drive.put('variables/program.json', data) }
+}
+
+// --- Fallback Module ---
+function fallback_module () {
+  return {
+    api: fallback_instance,
+    _: {
+      form_input: { $: '' },
+      input_test: { $: '' },
+      form_tile_split_choice: { $: '' },
+      form_click_rate_test: { $: '' },
+      net_helper: { $: '' }
+    }
+  }
+
+  function fallback_instance () {
+    return {
+      _: {
+        net_helper: { 0: '' }
+      },
+      drive: {
+        'style/': {
+          'program.css': {
+            raw: `
+              .main {
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+              }
+            `
+          }
+        },
+        'variables/': {
+          'program.json': { $ref: 'program.json' }
+        }
+      }
+    }
+  }
+}
+
+}).call(this)}).call(this,"/node_modules/ui-components/src/node_modules/program/program.js")
+},{"STATE":1,"form_click_rate_test":12,"form_input":13,"form_tile_split_choice":14,"input_test":17,"net_helper":18}],20:[function(require,module,exports){
+(function (__filename){(function (){
+const STATE = require('STATE')
+const statedb = STATE(__filename)
+const { get } = statedb(fallback_module)
+// const DOCS = require('DOCS')
+// const docs = DOCS(__filename)()
+const net = require('net_helper')
+
+const console_history = require('console_history')
+const actions = require('actions')
+const tabbed_editor = require('tabbed_editor')
+const graph_viewer = require('graph_viewer')
+const docs_window = require('docs_window')
+
+module.exports = program_container
+
+async function program_container (opts, invite) {
+  const { id, sdb } = await get(opts.sid)
+  const { drive } = sdb
+
+  const on = {
+    style: inject
+  }
+  const { io, _ } = net(id)
+
+  const el = document.createElement('div')
+  const shadow = el.attachShadow({ mode: 'closed' })
+  shadow.innerHTML = `
+  <div class="program-container main">
+    <docs-window-placeholder></docs-window-placeholder>
+    <graph-explorer-placeholder></graph-explorer-placeholder>
+    <actions-placeholder></actions-placeholder>
+    <tabbed-editor-placeholder></tabbed-editor-placeholder>
+    <console-history-placeholder></console-history-placeholder>
+  </div>`
+  const sheet = new CSSStyleSheet()
+  shadow.adoptedStyleSheets = [sheet]
+
+  const program_main = shadow.querySelector('.program-container')
+  const graph_explorer_placeholder = shadow.querySelector('graph-explorer-placeholder')
+  const actions_placeholder = shadow.querySelector('actions-placeholder')
+  const tabbed_editor_placeholder = shadow.querySelector('tabbed-editor-placeholder')
+  const console_placeholder = shadow.querySelector('console-history-placeholder')
+  const docs_window_placeholder = shadow.querySelector('docs-window-placeholder')
+
+  let console_history_el = null
+  let docs_window_el = null
+  let actions_el = null
+  let tabbed_editor_el = null
+  let graph_explorer_el = null
+
+  const subs = await sdb.watch(onbatch)
+
+  io.on = {
+    up: io_up(),
+    console_history: io_console_history(),
+    actions: io_actions(),
+    tabbed_editor: io_tabbed_editor(),
+    graph_explorer: io_graph_explorer(),
+    docs_window: io_docs_window()
+  }
+  if (invite) io.accept(invite)
+
+  actions_el = await actions({ ...subs[1] }, io.invite('actions', { up: id }))
+  actions_el.classList.add('actions')
+  actions_placeholder.replaceWith(actions_el)
+
+  tabbed_editor_el = await tabbed_editor({ ...subs[2] }, io.invite('tabbed_editor', { up: id }))
+  tabbed_editor_el.classList.add('tabbed-editor')
+  tabbed_editor_placeholder.replaceWith(tabbed_editor_el)
+
+  docs_window_el = await docs_window({ ...subs[4] }, io.invite('docs_window', { up: id }))
+  docs_window_el.classList.add('docs-window')
+  docs_window_el.classList.add('hide')
+  docs_window_placeholder.replaceWith(docs_window_el)
+
+  graph_explorer_el = await graph_viewer({ ...subs[3] }, io.invite('graph_explorer', { up: id }))
+  graph_explorer_el.classList.add('graph-explorer')
+  graph_explorer_placeholder.replaceWith(graph_explorer_el)
+
+  console_history_el = await console_history({ ...subs[0] }, io.invite('console_history', { up: id }))
+  console_history_el.classList.add('console-history')
+  console_placeholder.replaceWith(console_history_el)
+  let console_view = false
+  let actions_view = false
+  let graph_explorer_view = false
+
+  if (invite) {
+    console_history_el.classList.add('hide')
+    actions_el.classList.add('hide')
+    tabbed_editor_el.classList.add('show')
+    graph_explorer_el.classList.add('hide')
+
+    // Send message to root to set doc display handler
+    _.up('set_doc_display_handler', {}, { callback: on_doc_display })
+  }
+
+  if (!invite) {
+    actions_view = !actions_el.classList.contains('hide')
+    console_view = !console_history_el.classList.contains('hide')
+    graph_explorer_view = !graph_explorer_el.classList.contains('hide')
+  }
+  update_program_layout()
+
+  return el
+
+  function console_history_toggle_view () {
+    const next_view = !console_view
+    set_panel_visibility(console_history_el, next_view)
+    console_view = next_view
+    update_program_layout()
+  }
+
+  function actions_toggle_view (display_data) {
+    const next_view = resolve_display_state(display_data, actions_view)
+    set_panel_visibility(actions_el, next_view)
+    actions_view = next_view
+    update_program_layout()
+  }
+
+  function graph_explorer_toggle_view () {
+    const next_view = !graph_explorer_view
+    set_panel_visibility(graph_explorer_el, next_view)
+    graph_explorer_view = next_view
+    update_program_layout()
+  }
+
+  function resolve_display_state (display_data, current_view) {
+    if (typeof display_data === 'boolean') return display_data
+    if (typeof display_data === 'string') return display_data !== 'none'
+    if (typeof display_data === 'object' && display_data.display !== undefined) return display_data.display !== 'none'
+    return !current_view
+  }
+
+  function set_panel_visibility (panel_el, visible) {
+    if (visible) {
+      panel_el.classList.remove('hide')
+      panel_el.classList.add('show')
+    } else {
+      panel_el.classList.remove('show')
+      panel_el.classList.add('hide')
+    }
+  }
+
+  function tabbed_editor_toggle_view (show = true) {
+    if (show) {
+      set_panel_visibility(tabbed_editor_el, true)
+      set_panel_visibility(actions_el, false)
+      set_panel_visibility(console_history_el, false)
+      set_panel_visibility(graph_explorer_el, false)
+      actions_view = false
+      console_view = false
+      graph_explorer_view = false
+    } else {
+      set_panel_visibility(tabbed_editor_el, false)
+    }
+    update_program_layout()
+  }
+
+  function update_program_layout () {
+    const tabbed_visible = !tabbed_editor_el.classList.contains('hide')
+    const graph_visible = !graph_explorer_el.classList.contains('hide')
+    const actions_visible = !actions_el.classList.contains('hide')
+    const console_visible = !console_history_el.classList.contains('hide')
+    const has_primary = tabbed_visible || graph_visible
+
+    let tabbed_row = '0px'
+    let graph_row = '0px'
+    let actions_row = '0px'
+    let console_row = '0px'
+
+    if (tabbed_visible) {
+      tabbed_row = graph_visible ? 'minmax(120px, 1fr)' : 'minmax(80px, 1fr)'
+    }
+    if (graph_visible) {
+      graph_row = tabbed_visible ? 'minmax(150px, 1fr)' : 'minmax(200px, 1fr)'
+    }
+    if (actions_visible) {
+      if (!has_primary && !console_visible) actions_row = 'minmax(80px, 1fr)'
+      else actions_row = 'fit-content(260px)'
+    }
+    if (console_visible) {
+      if (!has_primary && !actions_visible) console_row = 'minmax(80px, 1fr)'
+      else console_row = 'fit-content(260px)'
+    }
+    if (!tabbed_visible && !graph_visible && !actions_visible && !console_visible) {
+      tabbed_row = '1fr'
+    }
+
+    program_main.style.gridTemplateRows = `${tabbed_row} ${graph_row} ${actions_row} ${console_row}`
+  }
+
+  async function onbatch (batch) {
+    for (const { type, paths } of batch) {
+      const data = await Promise.all(paths.map(load_path_raw))
+      const func = on[type] || fail
+      func({ data, type })
+    }
+
+    function load_path_raw (path) { return drive.get(path).then(read_drive_file_raw) }
+    function read_drive_file_raw (file) { return file.raw }
+  }
+  function fail ({ data, type }) { console.warn('invalid message', { cause: { data, type } }) }
+  function inject ({ data }) { sheet.replaceSync(data[0]) }
+
+  function on_doc_display (display_data) {
+    const { content, sid } = display_data
+    docs_window_el.classList.remove('hide')
+    _.docs_window('display_doc', {}, { content, sid })
+  }
+
+  // ---------
+  // PROTOCOLS
+  // ---------
+
+  function io_console_history () {
+    return function console_history_protocol (msg) { _.up(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+  }
+
+  function io_actions () {
+    return function actions_protocol (msg) {
+      const action_handlers = {
+        selected_action: actions_selected_action,
+        ui_focus_docs: actions_ui_focus_docs,
+        ui_focus: actions_forward_up
+      }
+
+      const handler = action_handlers[msg.type] || actions_forward_up
+      handler(msg)
+
+      function actions_forward_up (msg) { _.up(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+    }
+  }
+
+  function actions_selected_action (msg) {
+    const { data } = msg
+    _.up('update_quick_actions_input', msg.head ? { cause: msg.head } : {}, data)
+  }
+
+  function actions_ui_focus_docs (msg) { _.up(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+
+  function io_tabbed_editor () {
+    return function tabbed_editor_protocol (msg) { _.up(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+  }
+
+  function io_graph_explorer () {
+    return function graph_explorer_protocol (msg) { _.up(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+  }
+
+  function io_docs_window () {
+    return function docs_window_protocol (msg) {
+      const action_handlers = {
+        close_docs: docs_window_close_docs
+      }
+      const handler = action_handlers[msg.type] || docs_window_noop
+      handler(msg)
+      _.up(msg.type, msg.head ? { cause: msg.head } : {}, msg.data)
+
+      function docs_window_close_docs () { docs_window_el.classList.add('hide') }
+      function docs_window_noop () {}
+    }
+  }
+
+  function io_up () {
+    return function onmessage (msg) {
+      const action_handlers = {
+        console_history_toggle: onmessage_console_history_toggle,
+        graph_explorer_toggle: onmessage_graph_explorer_toggle,
+        display_actions: onmessage_display_actions,
+        filter_actions: onmessage_filter_actions,
+        tab_name_clicked: onmessage_tab_name_clicked,
+        tab_close_clicked: onmessage_tab_close_clicked,
+        switch_tab: onmessage_switch_tab,
+        entry_toggled: onmessage_entry_toggled,
+        execute_step: onmessage_execute_step,
+        display_doc: onmessage_display_doc,
+        load_actions: onmessage_send_actions,
+        update_actions_for_app: onmessage_send_actions
+      }
+      const handler = action_handlers[msg.type] || fail
+      handler(msg)
+
+      function onmessage_console_history_toggle () { console_history_toggle_view() }
+      function onmessage_graph_explorer_toggle () { graph_explorer_toggle_view() }
+      function onmessage_display_actions (msg) { actions_toggle_view(msg.data) }
+      function onmessage_filter_actions (msg) { _.actions(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+      function onmessage_tab_close_clicked (msg) {
+        _.tabbed_editor('close_tab', msg.head ? { cause: msg.head } : {}, msg.data)
+        _.console_history('record_closed_tab', msg.head ? { cause: msg.head } : {}, msg.data)
+      }
+      function onmessage_entry_toggled (msg) { _.graph_explorer(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+      function onmessage_execute_step (msg) {
+        if (!msg.data || !Array.isArray(msg.data.commands) || msg.data.commands.length === 0) return
+        set_panel_visibility(graph_explorer_el, true)
+        graph_explorer_view = true
+        update_program_layout()
+        _.graph_explorer(msg.type, msg.head ? { cause: msg.head } : {}, msg.data)
+      }
+      function onmessage_send_actions (msg) { _.actions(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+      function onmessage_tab_name_clicked (msg) {
+        tabbed_editor_toggle_view(true)
+        _.tabbed_editor('toggle_tab', msg.head ? { cause: msg.head } : {}, msg.data)
+      }
+      function onmessage_switch_tab (msg) {
+        tabbed_editor_toggle_view(true)
+        _.tabbed_editor(msg.type, msg.head ? { cause: msg.head } : {}, msg.data)
+      }
+      function onmessage_display_doc (msg) {
+        docs_window_el.classList.remove('hide')
+        _.docs_window(msg.type, msg.head ? { cause: msg.head } : {}, msg.data)
+      }
+    }
+  }
+}
+
+function fallback_module () {
+  return {
+    api: fallback_instance,
+    _: {
+      console_history: {
+        $: ''
+      },
+      actions: {
+        $: ''
+      },
+      tabbed_editor: {
+        $: ''
+      },
+      graph_viewer: {
+        $: ''
+      },
+      docs_window: {
+        $: ''
+      },
+      net_helper: {
+        $: ''
+      }
+      // DOCS: {
+      //   $: ''
+      // },
+    }
+  }
+
+  function fallback_instance () {
+    return {
+      _: {
+        console_history: {
+          0: '',
+          mapping: {
+            style: 'style',
+            commands: 'commands',
+            icons: 'icons',
+            scroll: 'scroll',
+            docs: 'docs',
+            actions: 'actions'
+          }
+        },
+        actions: {
+          0: '',
+          mapping: {
+            style: 'style',
+            actions: 'actions',
+            icons: 'icons',
+            hardcons: 'hardcons',
+            docs: 'docs'
+          }
+        },
+        tabbed_editor: {
+          0: '',
+          mapping: {
+            style: 'style',
+            files: 'files',
+            highlight: 'highlight',
+            active_tab: 'active_tab',
+            docs: 'docs'
+          }
+        },
+        graph_viewer: {
+          0: '',
+          mapping: {
+            theme: 'style',
+            entries: 'entries',
+            runtime: 'runtime',
+            mode: 'mode',
+            flags: 'flags',
+            keybinds: 'keybinds',
+            undo: 'undo',
+            docs: 'docs'
+          }
+        },
+        docs_window: {
+          0: '',
+          mapping: {
+            style: 'docs_style'
+          }
+        },
+        net_helper: {
+          0: ''
+        }
+        // DOCS: {
+        //   0: ''
+        // },
+      },
+      drive: {
+        'style/': {
+          'theme.css': {
+            raw: `
+              .program-container {
+                display: grid;
+                grid-template-columns: minmax(0, 1fr);
+                min-height: 200px;
+                height: 100%;
+                background: linear-gradient(135deg, #0d1117 0%, #161b22 100%);
+                position: relative;
+                gap: 0;
+                padding: 0;
+                overflow: hidden;
+                container-type: size;
+              }
+              .docs-window {
+                position: absolute;
+                inset: 12px;
+                z-index: 20;
+              }
+              .tabbed-editor {
+                grid-row: 1;
+                grid-column: 1;
+                min-height: 0;
+                min-width: 0;
+                width: 100%;
+                height: 100%;
+              }
+              .graph-explorer {
+                grid-row: 2;
+                grid-column: 1;
+                min-height: 0;
+                min-width: 0;
+                width: 100%;
+                height: 100%;
+              }
+              .console-history {
+                grid-row: 4;
+                grid-column: 1;
+                display: flex;
+                flex-direction: column;
+                position: relative;
+                width: 100%;
+                height: 100%; 
+                max-height: min(400px, 100%);       
+                min-height: 0;
+                min-width: 0;
+                background-color: #161b22;
+                border: 1px solid #21262d;
+                border-radius: 6px;
+                box-sizing: border-box;
+                overflow: hidden;
+                scrollbar-gutter: stable;
+                scrollbar-width: thin;
+                scrollbar-color: #30363d transparent;
+              }
+              .actions {
+                grid-row: 3;
+                grid-column: 1;
+                position: relative;
+                background-color: #161b22;
+                border: 1px solid #21262d;
+                border-radius: 6px;
+                overflow: hidden;
+              }
+              .tabbed-editor {
+                position: relative;
+                width: 100%;
+                min-width: 0;
+                background-color: #0d1117;
+                border: 1px solid #21262d;
+                border-radius: 6px;
+                overflow: hidden;
+              }
+              .show {
+                display: block;
+              }
+              .hide {
+                display: none;
+              }
+            `
+          }
+        },
+        'entries/': {},
+        'flags/': {},
+        'keybinds/': {},
+        'commands/': {},
+        'icons/': {},
+        'scroll/': {},
+        'actions/': {},
+        'hardcons/': {},
+        'files/': {},
+        'highlight/': {},
+        'active_tab/': {},
+        'runtime/': {},
+        'mode/': {},
+        'undo/': {},
+        'docs_style/': {}
+      }
+    }
+  }
+}
+
+}).call(this)}).call(this,"/node_modules/ui-components/src/node_modules/program_container/program_container.js")
+},{"STATE":1,"actions":9,"console_history":10,"docs_window":11,"graph_viewer":15,"net_helper":18,"tabbed_editor":23}],21:[function(require,module,exports){
+(function (__filename){(function (){
+const STATE = require('STATE')
+const statedb = STATE(__filename)
+const { get } = statedb(fallback_module)
+const DOCS = require('DOCS')
+const net = require('net_helper')
+
+module.exports = quick_actions
+
+async function quick_actions (opts, invite) {
+  const { id, sdb } = await get(opts.sid)
+  const { drive } = sdb
+
+  const on = {
+    style: inject,
+    icons: iconject,
+    hardcons: onhardcons,
+    actions: onactions,
+    prefs: onprefs
+  }
+
+  const el = document.createElement('div')
+  el.style.display = 'flex'
+  el.style.flex = 'auto'
+
+  const shadow = el.attachShadow({ mode: 'closed' })
+
+  shadow.innerHTML = `
+  <div class="quick-actions-container main">
+    <div class="default-actions"></div>
+    <div class="text-bar" role="button"></div>
+    <div class="input-wrapper" style="display: none;">
+      <div class="input-display">
+        <span class="slash-prefix">/</span>
+        <span class="command-text"></span>
+        <span class="step-display" style="display: none;">
+          <span>steps:</span>
+          <span class="current-step">1</span>
+          <span class="step-separator">-</span>
+          <span class="total-step">1</span>
+        </span>
+        <input class="input-field" type="text" placeholder="Type to search actions...">
+        <div class="input-tooltip" style="display: none;"></div>
+      </div>
+      <button class="confirm-btn" style="display: none;"></button>
+      <button class="submit-btn" style="display: none;"></button>
+      <button class="close-btn"></button>
+    </div>
+    <div class="tooltip hide"></div>
+  </div>`
+  const container = shadow.querySelector('.quick-actions-container')
+  const default_actions = shadow.querySelector('.default-actions')
+  const text_bar = shadow.querySelector('.text-bar')
+  const input_wrapper = shadow.querySelector('.input-wrapper')
+  const slash_prefix = shadow.querySelector('.slash-prefix')
+  const command_text = shadow.querySelector('.command-text')
+  const input_field = shadow.querySelector('.input-field')
+  const confirm_btn = shadow.querySelector('.confirm-btn')
+  const submit_btn = shadow.querySelector('.submit-btn')
+  const close_btn = shadow.querySelector('.close-btn')
+  const step_display = shadow.querySelector('.step-display')
+  const current_step = shadow.querySelector('.current-step')
+  const total_steps = shadow.querySelector('.total-step')
+  const tooltip = shadow.querySelector('.tooltip')
+  const input_tooltip = shadow.querySelector('.input-tooltip')
+  const sheet = new CSSStyleSheet()
+  shadow.adoptedStyleSheets = [sheet]
+
+  let init = false
+  let enable_quick_action_tooltips = false
+  let enable_input_field_tooltips = false
+  let icons = {}
+  let hardcons = {}
+  let defaults = []
+  let stored_selected_action = ''
+  let action_selected = false
+  const docs = DOCS(__filename)(opts.sid)
+  const { io, _ } = net(id)
+  const ui_actions = [
+    create_action('Open Quick Actions', 'Open the quick action input.', activate_input_field),
+    create_action('Close Quick Actions', 'Close the quick action input.', deactivate_input_field),
+    create_action('Confirm Quick Action', 'Continue with the selected action.', confirm_action),
+    create_action('Submit Quick Action', 'Submit the selected action.', submit_action)
+  ]
+  register_actions()
+
+  io.on = {
+    up: io_up()
+  }
+  if (invite) io.accept(invite)
+  on_open.info = ui_actions[0].info
+  on_close.info = ui_actions[1].info
+  on_confirm.info = ui_actions[2].info
+  on_submit.info = ui_actions[3].info
+  text_bar.onclick = docs.wrap_isolated(on_open)
+  close_btn.onclick = docs.wrap_isolated(on_close)
+  confirm_btn.onclick = docs.wrap_isolated(on_confirm)
+  submit_btn.onclick = docs.wrap_isolated(on_submit)
+  input_field.oninput = oninput
+
+  await sdb.watch(onbatch)
+
+  return el
+
+  function oninput (e) {
+    const value = e.target.value
+    if (enable_input_field_tooltips) update_input_tooltip(value)
+    _.up('filter_actions', {}, value)
+  }
+
+  function update_input_display (selected_action = null) {
+    if (selected_action) {
+      action_selected = true
+      slash_prefix.style.display = 'inline'
+      command_text.style.display = 'inline'
+      command_text.textContent = `#${selected_action.name}`
+      current_step.textContent = selected_action.current_step ? selected_action.current_step : 1
+      total_steps.textContent = selected_action.total_steps ? selected_action.total_steps : 1
+      step_display.style.display = 'inline-flex'
+
+      input_field.style.display = 'none'
+      confirm_btn.style.display = 'flex'
+      hide_input_tooltip()
+    } else {
+      slash_prefix.style.display = 'none'
+      command_text.style.display = 'none'
+      input_field.style.display = 'block'
+      confirm_btn.style.display = 'none'
+      submit_btn.style.display = 'none'
+      step_display.style.display = 'none'
+      input_field.placeholder = 'Type to search actions...'
+      hide_input_tooltip()
+      action_selected = false
+    }
+  }
+
+  function activate_input_field () {
+    if (action_selected) return
+    default_actions.style.display = 'none'
+    text_bar.style.display = 'none'
+
+    input_wrapper.style.display = 'flex'
+    input_field.focus()
+
+    if (enable_input_field_tooltips) update_input_tooltip('')
+
+    _.up('display_actions', {}, { display: 'block', reason: 'browse' })
+  }
+
+  function io_up () {
+    return function onmessage (msg) {
+      const { type, data } = msg
+      // No need to handle docs_toggle - DOCS module handles it globally
+      const message_map = {
+        deactivate_input_field,
+        show_submit_btn,
+        update_current_step,
+        hide_submit_btn,
+        update_quick_actions_for_app,
+        update_input_command
+      }
+      const handler = message_map[type] || fail
+      handler(data)
+    }
+  }
+
+  function deactivate_input_field (data = {}) {
+    const reason = data.reason ? data.reason : 'cancel'
+
+    default_actions.style.display = 'flex'
+    text_bar.style.display = 'flex'
+
+    input_wrapper.style.display = 'none'
+
+    input_field.value = ''
+    update_input_display()
+    hide_input_tooltip()
+
+    _.up('display_actions', {}, { display: 'none', reason })
+  }
+
+  function show_submit_btn () {
+    submit_btn.style.display = 'flex'
+    confirm_btn.style.display = 'none'
+  }
+  function hide_submit_btn () { submit_btn.style.display = 'none' }
+
+  function update_current_step (data) {
+    const current_step_value = data.index !== undefined ? data.index + 1 : 1
+    current_step.textContent = current_step_value
+  }
+
+  async function onbatch (batch) {
+    for (const { type, paths } of batch) {
+      const data = await Promise.all(paths.map(load_path_raw))
+      const func = on[type] || fail
+      func(data, type)
+    }
+    if (!init) {
+      create_default_actions(defaults)
+      init = true
+    } else {
+      // TODO: update actions
+    }
+
+    function load_path_raw (path) { return drive.get(path).then(read_drive_file_raw) }
+    function read_drive_file_raw (file) { return file.raw }
+  }
+  function fail (data, type) { console.warn(`Invalid message type: ${type}`, { cause: { data, type } }) }
+
+  function inject (data) { sheet.replaceSync(data[0]) }
+  function onhardcons (data) {
+    hardcons = {
+      submit: data[0],
+      cross: data[1],
+      confirm: data[2]
+    }
+    submit_btn.innerHTML = hardcons.submit
+    close_btn.innerHTML = hardcons.cross
+    confirm_btn.innerHTML = hardcons.confirm
+  }
+  function iconject (data) { icons = data }
+
+  function onactions (data) {
+    const vars = typeof data[0] === 'string' ? JSON.parse(data[0]) : data[0]
+    defaults = vars
+    register_actions()
+    create_default_actions(defaults)
+  }
+
+  function onprefs (data) {
+    const vars = typeof data[0] === 'string' ? JSON.parse(data[0]) : data[0]
+    enable_input_field_tooltips = vars.input_field
+    enable_quick_action_tooltips = vars.quick_actions
+  }
+
+  function create_default_actions (actions) {
+    default_actions.replaceChildren()
+    actions.forEach(create_action_button)
+  }
+
+  function create_action_button (action) {
+    const btn = document.createElement('div')
+    btn.classList.add('action-btn')
+    if (icons[action.icon] === undefined) {
+      const texon = action.name.substring(0, 2)
+      btn.innerHTML = texon
+    } else {
+      btn.innerHTML = icons[action.icon]
+    }
+    if (enable_quick_action_tooltips) {
+      btn.onmouseenter = on_action_btn_mouseenter
+      btn.onmouseleave = hide_tooltip
+    }
+    on_action_click.info = action.info
+    on_action_click.opts = { state: { name: action.name } }
+    btn.onclick = docs.wrap_isolated(on_action_click)
+    default_actions.appendChild(btn)
+
+    function on_action_click (event, $) { $($.state.name) }
+    function on_action_btn_mouseenter () { show_tooltip(btn, action.name) }
+  }
+
+  function update_input_tooltip (value) {
+    if (!value || value.trim() === '') {
+      hide_input_tooltip()
+      return
+    }
+    const tooltip_text = get_tooltip_text(value)
+    if (tooltip_text) {
+      show_input_tooltip(tooltip_text)
+    } else {
+      hide_input_tooltip()
+    }
+  }
+
+  function get_tooltip_text (value) {
+    const lower_value = value.toLowerCase().trim()
+    if (lower_value.length === 0) return null
+    if (defaults.length > 0) {
+      const matching = defaults.filter(matches_action_for_tooltip)
+      if (matching.length > 0) {
+        const names = matching.map(get_action_name)
+        return `Found ${matching.length} action${matching.length > 1 ? 's' : ''}: ${names.join(', ')}`
+      }
+    }
+    return 'No actions found. Try a different search term.'
+
+    function matches_action_for_tooltip (action) { return matches_action(action, lower_value) }
+    function get_action_name (action) { return action.name }
+  }
+
+  function matches_action (action, search_term) { return action.name.toLowerCase().includes(search_term) }
+
+  function show_input_tooltip (text) {
+    input_tooltip.textContent = text
+    input_tooltip.style.display = 'block'
+    position_input_tooltip()
+  }
+
+  function hide_input_tooltip () { input_tooltip.style.display = 'none' }
+
+  function position_input_tooltip () {
+    const input_rect = input_field.getBoundingClientRect()
+    const wrapper_rect = input_wrapper.getBoundingClientRect()
+    const tooltip_rect = input_tooltip.getBoundingClientRect()
+    const left = input_rect.left - wrapper_rect.left + (input_rect.width / 2) - (tooltip_rect.width / 2)
+    const top = input_rect.top - wrapper_rect.top - tooltip_rect.height - 8
+    input_tooltip.style.left = `${left}px`
+    input_tooltip.style.top = `${top}px`
+  }
+
+  function update_quick_actions_for_app (data) {
+    if (data) {
+      drive.put('actions/default.json', data)
+    }
+  }
+
+  function update_input_command (command) {
+    if (action_selected) return
+    stored_selected_action = command
+    if (input_wrapper.style.display === 'none') {
+      default_actions.style.display = 'none'
+      text_bar.style.display = 'none'
+      input_wrapper.style.display = 'flex'
+      input_field.focus()
+      if (enable_input_field_tooltips) update_input_tooltip('')
+    }
+
+    // Find the action that matches the command
+    const matching_action = defaults.find(matches_selected_command)
+    const selected = matching_action || command
+
+    if (matching_action) {
+      const pass_data = {
+        name: matching_action.name,
+        current_step: 1,
+        total_steps: matching_action.steps ? matching_action.steps.length : 1
+      }
+      update_input_display(pass_data)
+    } else {
+      const pass_data = {
+        name: typeof command === 'string' ? command : command.name,
+        current_step: 1,
+        total_steps: 3
+      }
+      update_input_display(pass_data)
+    }
+
+    _.up('display_actions', {}, { display: 'none', reason: 'selected' })
+    _.up('activate_steps_wizard', {}, stored_selected_action)
+
+    function matches_selected_command (action) {
+      const target = typeof command === 'string' ? command : command?.name
+      return action.name === target
+    }
+  }
+
+  function create_action (name, info, run) {
+    return { name, info, icon: 'action', status: { hidden: true }, steps: [], run }
+  }
+
+  function register_actions () {
+    docs.register_actions(ui_actions.concat(defaults.map(bind_action)))
+
+    function bind_action (action) {
+      return { ...action, run: select_action }
+
+      function select_action () { _.up('update_quick_actions_input', {}, action) }
+    }
+  }
+
+  function on_open (event, $) { $('Open Quick Actions') }
+  function on_close (event, $) { $('Close Quick Actions') }
+  function on_confirm (event, $) { $('Confirm Quick Action') }
+  function on_submit (event, $) { $('Submit Quick Action') }
+  function confirm_action () { _.up('activate_steps_wizard', {}, stored_selected_action) }
+  function submit_action () { _.up('action_submitted', {}, null) }
+
+  function show_tooltip (btn, name) {
+    tooltip.textContent = name
+    tooltip.style.display = 'block'
+    const btn_rect = btn.getBoundingClientRect()
+    const container_rect = container.getBoundingClientRect()
+    const tooltip_rect = tooltip.getBoundingClientRect()
+    const left = btn_rect.left - container_rect.left + (btn_rect.width / 2) - (tooltip_rect.width / 2)
+    const top = btn_rect.top - container_rect.top - tooltip_rect.height - 8
+    tooltip.style.left = `${left}px`
+    tooltip.style.top = `${top}px`
+  }
+
+  function hide_tooltip () { tooltip.style.display = 'none' }
+}
+
+function fallback_module () {
+  return {
+    api: fallback_instance,
+    _: {
+      DOCS: {
+        $: ''
+      },
+      net_helper: {
+        $: ''
+      }
+    }
+  }
+
+  function fallback_instance () {
+    return {
+      _: {
+        DOCS: {
+          0: ''
+        },
+        net_helper: {
+          0: ''
+        }
+      },
+      drive: {
+        'icons/': {
+          '0.svg': {
+            $ref: 'action1.svg'
+          },
+          '1.svg': {
+            $ref: 'action2.svg'
+          },
+          '2.svg': {
+            $ref: 'action1.svg'
+          },
+          '3.svg': {
+            $ref: 'action2.svg'
+          },
+          '4.svg': {
+            $ref: 'action1.svg'
+          }
+        },
+        'hardcons/': {
+          'submit.svg': {
+            $ref: 'submit.svg'
+          },
+          'close.svg': {
+            $ref: 'cross.svg'
+          },
+          'confirm.svg': {
+            $ref: 'check.svg'
+          }
+        },
+        'actions/': {
+          'default.json': {
+            raw: JSON.stringify([])
+          }
+        },
+        'docs/': {
+          'README.md': {
+            $ref: 'README.md'
+          }
+        },
+        'style/': {
+          'theme.css': {
+            raw: `
+              .quick-actions-container {
+                display: flex;
+                flex: auto;
+                flex-direction: row;
+                align-items: center;
+                background: #191919;
+                border-radius: 20px;
+                gap: 8px;
+                min-width: 200px;
+                position: relative;
+              }
+              .default-actions {
+                display: flex;
+                flex-direction: row;
+                align-items: center;
+                gap: 4px;
+                padding: 0 4px;
+              }
+              .action-btn {
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                background: transparent;
+                border: none;
+                padding: 6px;
+                border-radius: 50%;
+                cursor: pointer;
+                color: #a6a6a6;
+              }
+              .action-btn:hover {
+                background: rgba(255, 255, 255, 0.1);
+              }
+              .text-bar {
+                flex: 1;
+                height: 24px;
+                margin: 4px;
+                border-radius: 16px;
+                background: #131315;
+                cursor: pointer;
+                user-select: none;
+              }
+              .text-bar:hover {
+                background: #1a1a1c;
+              }
+              .input-wrapper {
+                display: flex;
+                flex: 1;
+                align-items: center;
+                background: #131315;
+                border-radius: 16px;
+                width: auto;
+                height: 30px;
+                border: 1px solid #3c3c3c;
+              }
+              .input-wrapper:focus-within {
+                border-color: #4285f4;
+                background: #1a1a1c;
+              }
+              .input-display {
+                display: flex;
+                flex: 1;
+                align-items: center;
+                padding: 0 12px;
+                min-height: 32px;
+                position: relative;
+              }
+              .slash-prefix {
+                color: #a6a6a6;
+                font-size: 14px;
+                margin-right: 4px;
+                display: none;
+              }
+              .command-text {
+                color: #e8eaed;
+                font-size: 14px;
+                background: #2d2d2d;
+                border: 1px solid #4285f4;
+                border-radius: 4px;
+                padding: 2px 6px;
+                font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+                display: none;
+              }
+              .input-field {
+                flex: 1;
+                min-height: 32px;
+                background: transparent;
+                border: none;
+                color: #e8eaed;
+                padding: 0 12px;
+                font-size: 14px;
+                outline: none;
+              }
+              .input-field::placeholder {
+                color: #a6a6a6;
+              }
+              .submit-btn {
+                display: none;
+                align-items: center;
+                justify-content: center;
+                background: #ffffff00;
+                border: none;
+                padding: 6px;
+                border-radius: 50%;
+                cursor: pointer;
+                color: white;
+                min-width: 32px;
+                height: 32px;
+                margin-right: 4px;
+                font-size: 12px;
+              }
+              .submit-btn:hover {
+                background: #ffffff00;
+              }
+              .confirm-btn {
+                display: none;
+                align-items: center;
+                justify-content: center;
+                background: transparent;
+                border: none;
+                padding: 6px;
+                border-radius: 50%;
+                cursor: pointer;
+                color: #a6a6a6;
+                min-width: 32px;
+                height: 32px;
+                margin-right: 4px;
+                font-size: 12px;
+              }
+              .confirm-btn:hover {
+                background: rgba(255, 255, 255, 0.1);
+              }
+              .close-btn {
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                background: transparent;
+                border: none;
+                padding: 6px;
+                border-radius: 50%;
+                cursor: pointer;
+                color: #a6a6a6;
+                min-width: 32px;
+                height: 32px;
+              }
+              .close-btn:hover {
+                background: rgba(255, 255, 255, 0.1);
+              }
+              svg {
+                width: 16px;
+                height: 16px;
+              }
+              .step-display {
+                display: inline-flex;
+                align-items: center;
+                gap: 2px;
+                margin-left: 8px;
+                background: #2d2d2d;
+                border: 1px solid #666;
+                border-radius: 4px;
+                padding: 1px 6px;
+                font-size: 12px;
+                color: #fff;
+                font-family: monospace;
+              }
+              .current-step {
+                color:#f0f0f0;
+              }
+              .step-separator {
+                color: #888;
+              }
+              .total-step {
+                color: #f0f0f0;
+              }
+              .hide {
+                display: none;
+              }
+              .tooltip {
+                position: absolute;
+                background: #2d2d2d;
+                color: #e8eaed;
+                padding: 6px 12px;
+                border-radius: 4px;
+                font-size: 12px;
+                white-space: nowrap;
+                pointer-events: none;
+                z-index: 1000;
+                box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+                border: 1px solid #3c3c3c;
+              }
+              .tooltip::after {
+                content: '';
+                position: absolute;
+                top: 100%;
+                left: 50%;
+                transform: translateX(-50%);
+                border: 4px solid transparent;
+                border-top-color: #2d2d2d;
+              }
+              .input-tooltip {
+                position: absolute;
+                background: #2d2d2d;
+                color: #e8eaed;
+                padding: 6px 12px;
+                border-radius: 4px;
+                font-size: 12px;
+                white-space: normal;
+                pointer-events: none;
+                z-index: 1001;
+                box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+                border: 1px solid #4285f4;
+                max-width: 300px;
+                word-wrap: break-word;
+              }
+              .input-tooltip::after {
+                content: '';
+                position: absolute;
+                top: 100%;
+                left: 50%;
+                transform: translateX(-50%);
+                border: 4px solid transparent;
+                border-top-color: #4285f4;
+              }
+            `
+          }
+        },
+        'prefs/': {
+          'tooltips.json': {
+            raw: JSON.stringify({
+              quick_actions: true,
+              input_field: false
+            })
+          }
+        }
+      }
+    }
+  }
+}
+
+}).call(this)}).call(this,"/node_modules/ui-components/src/node_modules/quick_actions/quick_actions.js")
+},{"DOCS":6,"STATE":1,"net_helper":18}],22:[function(require,module,exports){
+(function (__filename){(function (){
+const STATE = require('STATE')
+const statedb = STATE(__filename)
+const { get } = statedb(fallback_module)
+const DOCS = require('DOCS')
+const net = require('net_helper')
+
+module.exports = steps_wizard
+
+async function steps_wizard (opts, invite) {
+  const { id, sdb } = await get(opts.sid)
+  const { drive } = sdb
+
+  const on = {
+    style: inject
+  }
+
+  let currentActiveStep = 0
+  let current_steps = []
+  const click_state = { index: 0 }
+  const docs = DOCS(__filename)(opts.sid)
+  const { io, _ } = net(id)
+
+  io.on = {
+    up: io_up()
+  }
+  if (invite) io.accept(invite)
+
+  const el = document.createElement('div')
+  const shadow = el.attachShadow({ mode: 'closed' })
+  shadow.innerHTML = `
+  <div class="steps-wizard main">
+    <div class="steps-container">
+      <div class="steps-slot"></div>
+    </div>
+  </div>`
+  const sheet = new CSSStyleSheet()
+  shadow.adoptedStyleSheets = [sheet]
+  const steps_wizard_main = shadow.querySelector('.steps-wizard')
+  const steps_entries = shadow.querySelector('.steps-slot')
+  const select_step_action = {
+    name: 'Select Step',
+    info: 'Open the selected action step.',
+    icon: 'step',
+    status: { hidden: true },
+    steps: [],
+    run: select_step
+  }
+  docs.register_actions([select_step_action])
+  on_step_click.info = select_step_action.info
+  on_step_click.opts = { state: click_state }
+  await sdb.watch(onbatch)
+
+  return el
+
+  function io_up () {
+    return function onmessage ({ type, data }) {
+      // docs_toggle handled globally by DOCS module
+      if (type === 'init_data' && data) {
+        render_steps(data, true)
+      }
+    }
+  }
+
+  function render_steps (steps, auto_focus_first) {
+    if (!steps) { return }
+    current_steps = steps
+
+    const is_single_step = steps.length === 1
+    steps_wizard_main.style.display = is_single_step ? 'none' : ''
+
+    steps_entries.innerHTML = ''
+    currentActiveStep = 0
+
+    steps.forEach(create_step_button)
+
+    function create_step_button (step, index) {
+      const btn = document.createElement('button')
+      btn.className = 'step-button'
+      btn.textContent = step.name + (step.type === 'optional' ? ' *' : '')
+      btn.title = btn.textContent
+      btn.setAttribute('data-step', index + 1)
+
+      const accessible = can_access(index, steps)
+
+      let status = 'default'
+      if (!accessible) status = 'disabled'
+      else if (step.is_completed) status = 'completed'
+      else if (step.status === 'error') status = 'error'
+      else if (step.type === 'optional') status = 'optional'
+
+      btn.classList.add(`step-${status}`)
+
+      if (index === currentActiveStep - 1 && index > 0) {
+        btn.classList.add('back')
+      }
+      if (index === currentActiveStep + 1 && index < steps.length - 1) {
+        btn.classList.add('next')
+      }
+      if (index === currentActiveStep) {
+        btn.classList.add('active')
+      }
+
+      btn.onclick = docs.wrap_isolated(on_step_click)
+
+      steps_entries.appendChild(btn)
+
+      if (auto_focus_first && index === 0) {
+        btn.classList.add('active')
+        center_step(btn)
+        _.up('step_clicked', {}, { ...step, index: 0, total_steps: steps.length, is_accessible: accessible })
+      }
+    }
+  }
+
+  function on_step_click (event, $) {
+    $.state.index = Number(event.currentTarget.dataset.step) - 1
+    $('Select Step')
+  }
+
+  function select_step () {
+    const index = click_state.index
+    const step = current_steps[index]
+    const accessible = can_access(index, current_steps)
+    currentActiveStep = index
+    center_step(steps_entries.children[index])
+    render_steps(current_steps, false)
+    _.up('step_clicked', {}, { ...step, index, total_steps: current_steps.length, is_accessible: accessible })
+  }
+
+  function center_step (step_button) {
+    const container_width = steps_entries.clientWidth
+    const step_left = step_button.offsetLeft
+    const step_width = step_button.offsetWidth
+
+    const center_position = step_left - (container_width / 2) + (step_width / 2)
+
+    steps_entries.scrollTo({
+      left: center_position,
+      behavior: 'smooth'
+    })
+  }
+
+  function can_access (index, steps) {
+    for (let i = 0; i < index; i++) {
+      if (!steps[i].is_completed && steps[i].type !== 'optional') {
+        return false
+      }
+    }
+
+    return true
+  }
+
+  async function onbatch (batch) {
+    for (const { type, paths } of batch) {
+      const data = await Promise.all(paths.map(load_path_raw))
+      const func = on[type] || fail
+      func(data, type)
+    }
+
+    function load_path_raw (path) { return drive.get(path).then(read_drive_file_raw) }
+    function read_drive_file_raw (file) { return file.raw }
+  }
+  function fail (data, type) { console.warn('invalid message', { cause: { data, type } }) }
+
+  function inject (data) { sheet.replaceSync(data[0]) }
+}
+
+function fallback_module () {
+  return {
+    api: fallback_instance,
+    _: {
+      DOCS: {
+        $: ''
+      },
+      net_helper: {
+        $: ''
+      }
+    }
+  }
+
+  function fallback_instance () {
+    return {
+      _: {
+        DOCS: {
+          0: ''
+        },
+        net_helper: {
+          0: ''
+        }
+      },
+      drive: {
+        'docs/': {
+          'README.md': {
+            $ref: 'README.md'
+          }
+        },
+        'style/': {
+          'stepswizard.css': {
+            $ref: 'stepswizard.css'
+          }
+        }
+      }
+    }
+  }
+}
+
+}).call(this)}).call(this,"/node_modules/ui-components/src/node_modules/steps_wizard/steps_wizard.js")
+},{"DOCS":6,"STATE":1,"net_helper":18}],23:[function(require,module,exports){
+(function (__filename){(function (){
+const STATE = require('STATE')
+const statedb = STATE(__filename)
+const { get } = statedb(fallback_module)
+// const DOCS = require('DOCS')
+const net = require('net_helper')
+
+module.exports = tabbed_editor
+
+async function tabbed_editor (opts, invite) {
+  const { id, sdb } = await get(opts.sid)
+  const { drive } = sdb
+
+  const on = {
+    style: inject,
+    files: onfiles,
+    active_tab: onactivetab
+  }
+
+  const el = document.createElement('div')
+  const shadow = el.attachShadow({ mode: 'closed' })
+  shadow.innerHTML = `
+  <div class="tabbed-editor main">
+    <div class="editor-content">
+      <div class="editor-placeholder">
+        <div class="placeholder-text">Select a file to edit</div>
+      </div>
+    </div>
+  </div>`
+  const sheet = new CSSStyleSheet()
+  shadow.adoptedStyleSheets = [sheet]
+  const editor_content = shadow.querySelector('.editor-content')
+
+  let init = false
+  let files = {}
+  let active_tab = null
+  let current_editor = null
+  const on_message = {
+    switch_tab: handle_switch_tab,
+    close_tab: handle_close_tab,
+    toggle_tab: handle_toggle_tab
+  }
+
+  const { io, _ } = net(id)
+  io.on = {
+    up: io_up()
+  }
+  if (invite) io.accept(invite)
+  await sdb.watch(onbatch)
+
+  return el
+
+  function io_up () {
+    return function onmessage (msg) {
+      const handler = on_message[msg.type] || onmessage_fail
+      handler(msg)
+    }
+  }
+
+  function handle_switch_tab (msg) { switch_to_tab(msg.data, msg) }
+  function handle_close_tab (msg) {
+    const tab_data = msg.data
+    if (active_tab === tab_data.id) {
+      hide_editor()
+      active_tab = null
+    }
+
+    _.up('tab_closed', msg.head ? { cause: msg.head } : {}, tab_data)
+  }
+  function handle_toggle_tab (msg) {
+    const tab_data = msg.data
+    if (active_tab === tab_data.id) {
+      hide_editor()
+      active_tab = null
+    } else {
+      switch_to_tab(tab_data, msg)
+    }
+  }
+  function onmessage_fail () { /* docs_toggle @TODO */ }
+
+  function switch_to_tab (tab_data, msg) {
+    if (active_tab === tab_data.id) {
+      return
+    }
+
+    active_tab = tab_data.id
+    create_editor(tab_data)
+    _.up('tab_switched', msg?.head ? { cause: msg.head } : {}, tab_data)
+  }
+
+  function create_editor (tab_data) {
+    const parsed_data = JSON.parse(tab_data[0])
+    const file_content = files[parsed_data.id] || ''
+    // console.log('Creating editor for:', parsed_data)
+
+    editor_content.replaceChildren()
+
+    editor_content.innerHTML = `
+    <div class="code-editor">
+    <div class="editor-wrapper">
+      <div class="line-numbers"></div>
+      <textarea class="code-area" placeholder="Start editing ${parsed_data.name || parsed_data.id}...">${file_content}</textarea>
+    </div>
+    </div>`
+    const editor = editor_content.querySelector('.code-editor')
+    const line_numbers = editor_content.querySelector('.line-numbers')
+    const code_area = editor_content.querySelector('.code-area')
+    current_editor = { editor, code_area, line_numbers, tab_data: parsed_data }
+
+    code_area.oninput = handle_code_input
+    code_area.onscroll = handle_code_scroll
+
+    update_line_numbers()
+  }
+
+  function hide_editor () {
+    editor_content.innerHTML = `
+      <div class="editor-placeholder">
+        <div class="placeholder-text">Select a file to edit</div>
+      </div>`
+    current_editor = null
+  }
+
+  function update_line_numbers () {
+    if (!current_editor) return
+
+    const { code_area, line_numbers } = current_editor
+    const lines = code_area.value.split('\n')
+    const line_count = lines.length
+
+    let line_html = ''
+    for (let i = 1; i <= line_count; i++) {
+      line_html += `<div class="line-number">${i}</div>`
+    }
+
+    line_numbers.innerHTML = line_html
+  }
+
+  function save_file_content () {
+    if (!current_editor) return
+
+    const { code_area, tab_data } = current_editor
+    files[tab_data.id] = code_area.value
+    _.up('file_changed', {}, {
+      id: tab_data.id,
+      content: code_area.value
+    })
+  }
+
+  async function onbatch (batch) {
+    for (const { type, paths } of batch) {
+      const data = await Promise.all(paths.map(load_path_raw))
+      const func = on[type] || fail
+      func(data, type)
+    }
+    if (!init) {
+      init = true
+    }
+
+    function load_path_raw (path) { return drive.get(path).then(read_drive_file_raw) }
+    function read_drive_file_raw (file) { return file.raw }
+  }
+
+  function fail (data, type) { console.warn('Invalid message', { data, type }) }
+  function inject (data) { sheet.replaceSync(data[0]) }
+  function onfiles (data) { files = data[0] }
+
+  function onactivetab (data) {
+    if (data.id !== active_tab) {
+      switch_to_tab(data)
+    }
+  }
+
+  function handle_code_input () {
+    update_line_numbers()
+    save_file_content()
+  }
+
+  function handle_code_scroll () {
+    if (!current_editor) return
+    const { code_area, line_numbers } = current_editor
+    line_numbers.scrollTop = code_area.scrollTop
+  }
+}
+
+function fallback_module () {
+  return {
+    api: fallback_instance,
+    _: {
+      net_helper: {
+        $: ''
+      }
+      // DOCS: {
+      //   $: ''
+      // },
+    }
+  }
+
+  function fallback_instance () {
+    return {
+      _: {
+        net_helper: {
+          0: ''
+        }
+        // DOCS: {
+        //   0: ''
+        // },
+      },
+      drive: {
+        'files/': {
+          'example.js': {
+            raw: `
+              function hello() {
+                console.log("Hello, World!");
+              }
+
+              const x = 42;
+              let y = "string";
+
+              if (x > 0) {
+                hello();
+              }
+            `
+          },
+          'example.md': {
+            raw: `
+              # Example Markdown
+              This is an **example** markdown file.
+
+              ## Features
+
+              - Syntax highlighting
+              - Line numbers
+              - File editing
+
+              \`\`\`javascript
+              function example() {
+                return true;
+              }
+              \`\`\`
+            `
+          },
+          'data.json': {
+            raw: `
+              {
+                "name": "example",
+                "version": "1.0.0",
+                "dependencies": {
+                "lodash": "^4.17.21"
+              }
+            `
+          }
+        },
+        'docs/': {
+          'README.md': {
+            $ref: 'README.md'
+          }
+        },
+        'style/': {
+          'theme.css': {
+            raw: `
+              .tabbed-editor {
+                width: 100%;
+                height: 100%;
+                min-height: 80px;
+                background-color: #0d1117;
+                color: #e6edf3;
+                font-family: 'SFMono-Regular', 'Consolas', 'Liberation Mono', 'Menlo', monospace;
+                display: grid;
+                grid-template-rows: 1fr;
+                position: relative;
+                border: 1px solid #30363d;
+                border-radius: 6px;
+                box-sizing: border-box;
+                overflow: hidden;
+              }
+
+              .editor-content {
+                display: grid;
+                grid-template-rows: 1fr;
+                min-height: 0;
+                position: relative;
+                overflow: hidden;
+                background-color: #0d1117;
+              }
+
+              .editor-placeholder {
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                height: 100%;
+                color: #7d8590;
+                font-style: italic;
+                font-size: 16px;
+                background: linear-gradient(135deg, #0d1117 0%, #161b22 100%);
+              }
+
+              .code-editor {
+                height: 100%;
+                min-height: 0;
+                display: grid;
+                grid-template-rows: 1fr;
+                background-color: #0d1117;
+              }
+
+              .editor-wrapper {
+                display: grid;
+                grid-template-columns: auto 1fr;
+                min-height: 0;
+                height: 100%;
+                position: relative;
+                box-sizing: border-box;
+                overflow: auto;
+                scrollbar-gutter: stable;
+                scrollbar-width: thin;
+                scrollbar-color: #30363d transparent;
+                background-color: #0d1117;
+              }
+
+              .line-numbers {
+                background-color: #161b22;
+                color: #7d8590;
+                padding: 12px 16px;
+                text-align: right;
+                user-select: none;
+                font-size: 13px;
+                line-height: 20px;
+                font-weight: 400;
+                border-right: 1px solid #21262d;
+                position: sticky;
+                left: 0;
+                z-index: 1;
+                height: 100%;
+              }
+
+              .line-number {
+                height: 20px;
+                line-height: 20px;
+                transition: color 0.1s ease;
+              }
+
+              .line-number:hover {
+                color: #f0f6fc;
+              }
+
+              .code-area {
+                background-color: #0d1117;
+                color: #e6edf3;
+                border: none;
+                outline: none;
+                resize: none;
+                font-family: 'SFMono-Regular', 'Consolas', 'Liberation Mono', 'Menlo', monospace;
+                font-size: 13px;
+                line-height: 20px;
+                padding: 12px 16px;
+                position: relative;
+                z-index: 2;
+                tab-size: 2;
+                white-space: pre;
+                overflow-wrap: normal;
+                overflow-x: auto;
+              }
+
+              .code-area:focus {
+                background-color: #0d1117;
+                box-shadow: none;
+              }
+
+              .code-area::selection {
+                background-color: #264f78;
+              }
+
+              .editor-wrapper::-webkit-scrollbar {
+                width: 10px;
+                height: 10px;
+              }
+
+              .editor-wrapper::-webkit-scrollbar-track {
+                background: transparent;
+              }
+
+              .editor-wrapper::-webkit-scrollbar-thumb {
+                background: #30363d;
+                border: 2px solid transparent;
+                border-radius: 999px;
+                background-clip: content-box;
+              }
+
+              .editor-wrapper::-webkit-scrollbar-thumb:hover {
+                background: #484f58;
+                border: 2px solid transparent;
+                background-clip: content-box;
+              }
+            `
+          }
+        },
+        'active_tab/': {
+          'current.json': {
+            raw: JSON.stringify({
+              id: 'example.js',
+              name: 'example.js'
+            })
+          }
+        }
+      }
+    }
+  }
+}
+
+}).call(this)}).call(this,"/node_modules/ui-components/src/node_modules/tabbed_editor/tabbed_editor.js")
+},{"STATE":1,"net_helper":18}],24:[function(require,module,exports){
+(function (__filename){(function (){
+const STATE = require('STATE')
+const statedb = STATE(__filename)
+const { get } = statedb(fallback_module)
+const DOCS = require('DOCS')
+const net = require('net_helper')
+
+module.exports = component
+
+async function component (opts, invite) {
+  const { id, sdb } = await get(opts.sid)
+  const { drive } = sdb
+
+  const on = {
+    variables: onvariables,
+    style: inject,
+    icons: iconject,
+    scroll: onscroll
+  }
+  const div = document.createElement('div')
+  const shadow = div.attachShadow({ mode: 'closed' })
+  shadow.innerHTML = `
+  <div class="tab-entries main"></div>`
+  const entries = shadow.querySelector('.tab-entries')
+  const sheet = new CSSStyleSheet()
+  shadow.adoptedStyleSheets = [sheet]
+
+  let init = false
+  let variables = []
+  let dricons = []
+  let active = null
+  let tab_group_el = null
+  let nested_collapse_el = null
+  const expanded_groups = {}
+  let current_collapse_data = null
+  let tab_group_expanded = false
+  let tile_is_focused = false
+  let docs_action_id = 0
+  const default_tabs = {}
+  const link_tabs = {}
+  const variable_tabs = {}
+  let ARROW_LEFT_SVG = ''
+  let ARROW_RIGHT_SVG = ''
+  let SEPARATOR_SVG = ''
+  const docs = DOCS(__filename)(opts.sid)
+  const { io, _ } = net(id)
+
+  const actions_file = await drive.get('actions/commands.json')
+  const docs_actions = actions_file.raw
+    ? (typeof actions_file.raw === 'string' ? JSON.parse(actions_file.raw) : actions_file.raw)
+    : []
+  docs.register_actions(docs_actions)
+
+  await sdb.watch(onbatch)
+  io.on = {
+    up: io_up()
+  }
+  if (invite) io.accept(invite)
+  if (entries) {
+    let is_down = false
+    let start_x
+    let scroll_start
+
+    function stop_drag_scroll () {
+      is_down = false
+      entries.classList.remove('grabbing')
+      update_scroll_position()
+    }
+
+    function move_drag_scroll (pointer_x) {
+      if (!is_down) return
+      if (entries.scrollWidth <= entries.clientWidth) return stop_drag_scroll()
+      entries.scrollLeft = scroll_start - (pointer_x - start_x) * 1.5
+    }
+
+    entries.onmousedown = on_entries_mousedown
+
+    function on_entries_mousedown (e) {
+      if (entries.scrollWidth <= entries.clientWidth) return
+      is_down = true
+      entries.classList.add('grabbing')
+      start_x = e.pageX - entries.offsetLeft
+      scroll_start = entries.scrollLeft
+      window.onmousemove = on_window_mousemove
+      window.onmouseup = on_window_mouseup
+    }
+
+    function on_window_mousemove (e) {
+      move_drag_scroll(e.pageX - entries.offsetLeft)
+      e.preventDefault()
+    }
+
+    function on_window_mouseup () {
+      stop_drag_scroll()
+      window.onmousemove = null
+      window.onmouseup = null
+    }
+
+    entries.onmouseleave = stop_drag_scroll
+    entries.ontouchstart = on_entries_touchstart
+
+    function on_entries_touchstart (e) {
+      if (entries.scrollWidth <= entries.clientWidth) return
+      is_down = true
+      start_x = e.touches[0].pageX - entries.offsetLeft
+      scroll_start = entries.scrollLeft
+    }
+
+    ;['ontouchend', 'ontouchcancel'].forEach(bind_touch_end_handler)
+    entries.ontouchmove = on_entries_touchmove
+
+    function bind_touch_end_handler (event_name) { entries[event_name] = stop_drag_scroll }
+    function on_entries_touchmove (e) {
+      move_drag_scroll(e.touches[0].pageX - entries.offsetLeft)
+      e.preventDefault()
+    }
+  }
+  return div
+
+  function io_up () {
+    const on = {
+      add_link_tab: handle_add_link_tab,
+      remove_link_tab: handle_remove_link_tab,
+      add_default_tab: handle_add_default_tab,
+      restore_tab: handle_restore_tab,
+      show_collapsed_tab_group: handle_show_collapsed_tab_group,
+      hide_collapsed_tab_group: handle_hide_collapsed_tab_group,
+      tile_focus_changed: handle_tile_focus_changed,
+      sync_tab_count: handle_sync_tab_count
+    }
+    return function onmessage (msg) {
+      console.error('tabs: message from up', msg)
+      ;(on[msg.type] || onfail)(msg)
+    }
+    function handle_add_link_tab ({ data }) { add_link_tab(data) }
+    function handle_remove_link_tab ({ data }) { remove_link_tab(data) }
+    function handle_add_default_tab ({ data }) { add_default_tab(data) }
+    function handle_restore_tab ({ data }) { 
+      create_btn({ name: data.name, id: data.id })
+      sync_tab_count() 
+    }
+    function handle_show_collapsed_tab_group ({ data }) { show_collapsed_tab_group(data) }
+    function handle_hide_collapsed_tab_group () { hide_collapsed_tab_group() }
+    function handle_tile_focus_changed ({ data }) { update_tab_focus_state(data) }
+    function handle_sync_tab_count () { sync_tab_count() }
+    function onfail (msg) { console.error('tabs: unknown message', msg) }
+  }
+
+  function add_default_tab ({ name, program, tile_id, id }) {
+    const tab_id = id || 'tab_' + Date.now()
+    if (default_tabs[tab_id]) {
+      console.error('tabs: default tab already exists', tab_id)
+      return
+    }
+    const el = document.createElement('div')
+    el.innerHTML = `
+    <span class="icon">${dricons[1] || '📄'}</span>
+    <span class='name'>${tab_id}</span>
+    <span class="name">${name || 'New Tab'}</span>
+    <button class="btn">${dricons[0] || '×'}</button>`
+    el.className = 'tabsbtn default-tab active'
+    const name_el = el.querySelector('.name')
+    const close_btn = el.querySelector('.btn')
+    default_tabs[tab_id] = { el, name_el, close_btn, name, program }
+    if (active) active.classList.remove('active')
+    active = el
+    name_el.onclick = switch_active
+    close_btn.onclick = close_tab
+    entries.appendChild(el)
+    console.error('tabs: default tab added', tab_id)
+    sync_tab_count()
+    sync_separators()
+
+    function switch_active () {
+      console.error('tabs: default tab clicked', tab_id)
+      if (active) active.classList.remove('active')
+      el.classList.add('active')
+      active = el
+      const data = { id: tab_id, name, program }
+      _.up('ui_focus', {}, { type: 'tab', sid: opts.sid })
+      _.up('tab_name_clicked', {}, data)
+    }
+    function close_tab (e) {
+      e.stopPropagation()
+      console.error('tabs: default tab close clicked', tab_id)
+      el.remove()
+      delete default_tabs[tab_id]
+      if (active === el) active = null
+      _.up('tab_close_clicked', {}, { id: tab_id, name })
+      sync_tab_count()
+      if (Object.keys(default_tabs).length === 0) {
+        _.up('all_tabs_closed', {}, null)
+      }
+      sync_separators()
+    }
+  }
+
+  function add_link_tab ({ tile_id, name, direction }) {
+    const link_tab_id = 'split_tile_' + tile_id
+    if (link_tabs[link_tab_id]) {
+      console.error('tabs: link tab already exists', link_tab_id)
+      return
+    }
+    const el = document.createElement('div')
+    el.innerHTML = `
+    <span class="icon">⊞</span>
+    <span class="name">${name || 'Split ' + direction}</span>`
+    el.className = 'tabsbtn link-tab'
+    const name_el = el.querySelector('.name')
+    link_tabs[link_tab_id] = { el, name_el, tile_id, name, direction }
+    el.onclick = on_link_tab_click
+    entries.appendChild(el)
+    console.error('tabs: link tab added', link_tab_id)
+    sync_separators()
+
+    function on_link_tab_click () {
+      console.error('tabs: link tab clicked', link_tab_id)
+      _.up('link_tab_clicked', {}, { tile_id, link_tab_id })
+    }
+  }
+
+  function remove_link_tab ({ tile_id }) {
+    const link_tab_id = 'split_tile_' + tile_id
+    const tab = link_tabs[link_tab_id]
+    if (tab) {
+      tab.el.remove()
+      delete link_tabs[link_tab_id]
+      console.error('tabs: link tab removed', link_tab_id)
+      sync_separators()
+    }
+  }
+
+  function show_collapsed_tab_group (data) {
+    if (data.nested) {
+      show_nested_collapse(data)
+      return
+    }
+
+    const { tiles } = data
+    if (tab_group_el) hide_collapsed_tab_group()
+
+    tab_group_el = document.createElement('div')
+    tab_group_el.className = 'tab-group-inline'
+
+    const group_tab = document.createElement('div')
+    group_tab.className = 'tabsbtn tab-group-tab'
+    const direction = (tiles[0] && tiles[0].direction) || 'right'
+    const icon_svg = (direction === 'left' || direction === 'up') ? ARROW_LEFT_SVG : ARROW_RIGHT_SVG
+    group_tab.innerHTML = `<span class="icon">${icon_svg}</span><span class="name">Split</span>`
+    group_tab.onclick = toggle_tab_group_expand
+    tab_group_el.appendChild(group_tab)
+
+    const children_container = document.createElement('div')
+    children_container.className = 'tab-group-children'
+
+    for (const tile of tiles) {
+      const tile_tab_list = tile.tabs || []
+      for (const tab of tile_tab_list) {
+        const tab_el = document.createElement('div')
+        tab_el.className = 'tabsbtn tab-group-child'
+        tab_el.innerHTML = `<span class="icon">${dricons[1] || '📄'}</span><span class="name">${tab.name || 'Tab'}</span>`
+        tab_el.onclick = on_child_tab_click(tile.tile_id)
+        children_container.appendChild(tab_el)
+      }
+      if (tile_tab_list.length === 0) {
+        const placeholder_el = document.createElement('div')
+        placeholder_el.className = 'tabsbtn tab-group-child'
+        placeholder_el.innerHTML = `<span class="icon">${dricons[1] || '📄'}</span><span class="name">New Tab</span>`
+        placeholder_el.onclick = on_child_tab_click(tile.tile_id)
+        children_container.appendChild(placeholder_el)
+      }
+    }
+
+    tab_group_el.appendChild(children_container)
+    entries.insertBefore(tab_group_el, entries.firstChild)
+    console.error('tabs: collapsed tab group shown')
+    sync_separators()
+
+    function toggle_tab_group_expand () {
+      tab_group_expanded = !tab_group_expanded
+      tab_group_el.classList.toggle('expanded', tab_group_expanded)
+      sync_separators()
+    }
+
+    function on_child_tab_click (tile_id) {
+      return function () {
+        console.error('tabs: tab group child clicked, requesting expand', tile_id)
+        _.up('tab_group_tile_clicked', {}, { tile_id })
+      }
+    }
+  }
+
+  function hide_collapsed_tab_group () {
+    if (tab_group_el) {
+      tab_group_el.remove()
+      tab_group_el = null
+      tab_group_expanded = false
+      console.error('tabs: collapsed tab group hidden')
+    }
+    if (nested_collapse_el) {
+      nested_collapse_el.remove()
+      nested_collapse_el = null
+      console.error('tabs: nested collapse hidden')
+    }
+    sync_separators()
+  }
+
+  function show_nested_collapse (data) {
+    console.error('tabs: show_nested_collapse', data)
+    current_collapse_data = data
+    if (tab_group_el) {
+      tab_group_el.remove()
+      tab_group_el = null
+    }
+    if (nested_collapse_el) {
+      nested_collapse_el.remove()
+      nested_collapse_el = null
+    }
+
+    const { collapsed_groups } = data
+
+    if (!collapsed_groups || collapsed_groups.length === 0) return
+
+    nested_collapse_el = document.createElement('div')
+    nested_collapse_el.className = 'nested-collapse-container'
+
+    function get_first_leaf_node (node) {
+      if (!node) return null
+      if (node.type === 'leaf') return node
+      if (node.children && node.children.length > 0) {
+        return get_first_leaf_node(node.children[0])
+      }
+      return null
+    }
+
+    // `depth` is the nesting depth in the collapsed strip, it drives the size ramp in CSS.
+    function render_leaf_tab (lt, leaf, depth, is_header = false, is_expanded = false, parent_group = null) {
+      const el = document.createElement('div')
+      el.className = `tabsbtn nested-leaf-tab depth-${Math.min(depth + 1, 3)}`
+      if (active && active.querySelector('.name')?.textContent === (lt.name || 'Tab')) {
+        el.classList.add('active')
+      }
+
+      let arrow_btn_html = ''
+      if (is_header && parent_group) {
+        const icon_svg = is_expanded ? ARROW_LEFT_SVG : ARROW_RIGHT_SVG
+        arrow_btn_html = `<span class="icon group-arrow-btn">${icon_svg}</span>`
+      }
+
+      // A folded tab is a pointer to another tile, not an owned tab, so it has no close
+      // button: closing stays with the tile that owns the tab.
+      el.innerHTML = `
+        ${arrow_btn_html}
+        <span class="icon">${dricons[1] || '📄'}</span>
+        <span class="name">${lt.name || 'Tab'}</span>`
+
+      if (is_header && parent_group) {
+        const arrow_btn = el.querySelector('.group-arrow-btn')
+        if (arrow_btn) {
+          arrow_btn.onclick = (e) => {
+            e.stopPropagation()
+            expanded_groups[parent_group.split_id] = !is_expanded
+            show_nested_collapse(current_collapse_data)
+          }
+        }
+      }
+
+      const name_el = el.querySelector('.name')
+      if (name_el) {
+        name_el.onclick = on_folded_tab_click
+      }
+
+      return el
+
+      // Clicking a folded tab asks the tile manager to bring that tile back on screen.
+      function on_folded_tab_click () {
+        if (active) active.classList.remove('active')
+        el.classList.add('active')
+        active = el
+        _.up('ui_focus', {}, { type: 'tab', sid: opts.sid })
+        _.up('tab_group_tile_clicked', {}, { tile_id: leaf.tile_id, id: lt.id, name: lt.name })
+      }
+    }
+
+    function render_node_to_dom (node, depth, is_header_child = false, parent_group = null) {
+      if (!node) return null
+
+      if (node.type === 'leaf') {
+        const leaf_container = document.createElement('div')
+        leaf_container.className = 'nested-group-leaf'
+        leaf_container.setAttribute('data-depth', depth)
+
+        let leaf_tabs = node.tabs || []
+        if (leaf_tabs.length === 0) {
+          leaf_tabs = [{ id: 'placeholder', name: 'New Tab', tile_id: node.tile_id }]
+        }
+
+        if (is_header_child && parent_group) {
+          const is_expanded = !!expanded_groups[parent_group.split_id]
+          const header_tab = render_leaf_tab(leaf_tabs[0], node, depth, true, is_expanded, parent_group)
+          leaf_container.appendChild(header_tab)
+
+          if (is_expanded) {
+            for (let i = 1; i < leaf_tabs.length; i++) {
+              const normal_tab = render_leaf_tab(leaf_tabs[i], node, depth, false, false, null)
+              leaf_container.appendChild(normal_tab)
+            }
+          }
+        } else {
+          for (const lt of leaf_tabs) {
+            const normal_tab = render_leaf_tab(lt, node, depth, false, false, null)
+            leaf_container.appendChild(normal_tab)
+          }
+        }
+
+        return leaf_container
+      }
+
+      if (node.type === 'collapsed_group' || node.type === 'split_group') {
+        const is_expanded = !!expanded_groups[node.split_id]
+
+        if (!is_expanded) {
+          const first_leaf = get_first_leaf_node(node)
+          if (!first_leaf) return null
+
+          let leaf_tabs = first_leaf.tabs || []
+          if (leaf_tabs.length === 0) {
+            leaf_tabs = [{ id: 'placeholder', name: 'New Tab', tile_id: first_leaf.tile_id }]
+          }
+
+          const leaf_container = document.createElement('div')
+          leaf_container.className = 'nested-group-leaf'
+          leaf_container.setAttribute('data-depth', depth)
+
+          const header_tab = render_leaf_tab(leaf_tabs[0], first_leaf, depth, true, false, node)
+          leaf_container.appendChild(header_tab)
+          return leaf_container
+        } else {
+          const group_container = document.createElement('div')
+          group_container.className = `nested-group-container depth-${depth} expanded`
+          group_container.setAttribute('data-depth', depth)
+
+          if (node.children && node.children.length > 0) {
+            const first_child_el = render_node_to_dom(node.children[0], depth, true, node)
+            if (first_child_el) group_container.appendChild(first_child_el)
+
+            for (let i = 1; i < node.children.length; i++) {
+              const child_el = render_node_to_dom(node.children[i], depth + 1, false, null)
+              if (child_el) group_container.appendChild(child_el)
+            }
+          }
+
+          return group_container
+        }
+      }
+
+      return null
+    }
+
+    for (const group of collapsed_groups) {
+      const group_el = render_node_to_dom(group, 0, false, null)
+      if (group_el) nested_collapse_el.appendChild(group_el)
+    }
+
+    entries.insertBefore(nested_collapse_el, entries.firstChild)
+    console.error('tabs: nested collapse shown with', collapsed_groups.length, 'groups')
+    sync_separators()
+  }
+
+  function update_tab_focus_state ({ is_focused }) {
+    entries.classList.toggle('tile-focused', is_focused)
+    entries.classList.toggle('tile-inactive', !is_focused)
+  }
+
+  function get_tab_count () {
+    return Object.keys(default_tabs).length + Object.keys(variable_tabs).length
+  }
+
+  function sync_tab_count () {
+    _.up('update_tab_count', {}, { count: get_tab_count() })
+  }
+
+  async function create_btn ({ name, id }, index = 0) {
+    if (variable_tabs[id]) {
+      console.error('tabs: variable tab already exists', id)
+      return
+    }
+    const el = document.createElement('div')
+    el.innerHTML = `
+    <span class="icon">${dricons[index + 1] || dricons[1] || '📄'}</span>
+    <span class='name'>${id}</span>
+    <span class="name">${name}</span>
+    <button class="btn">${dricons[0] || '×'}</button>`
+
+    el.className = 'tabsbtn'
+    const name_el = el.querySelector('.name')
+    const close_btn = el.querySelector('.btn')
+
+    name_el.draggable = false
+
+    const action_id = ++docs_action_id
+    const open_action = create_action('Open Tab ' + action_id, 'Open the ' + name + ' tab.', 'tab', on_tab_name_click)
+    const close_action = create_action('Close Tab ' + action_id, 'Close the ' + name + ' tab.', 'close', on_tab_close_click)
+    on_name_click.info = open_action.info
+    on_name_click.opts = { state: { action: open_action.name } }
+    on_close_click.info = close_action.info
+    on_close_click.opts = { state: { action: close_action.name } }
+    name_el.onclick = docs.wrap_isolated(on_name_click)
+    close_btn.onclick = docs.wrap_isolated(on_close_click)
+    variable_tabs[id] = { el, name, actions: [open_action, close_action] }
+    register_actions()
+
+    function on_name_click (event, $) { $($.state.action) }
+    function on_close_click (event, $) {
+      event.stopPropagation()
+      $($.state.action)
+    }
+    function on_tab_name_click () {
+      const data = { type: 'tab', sid: opts.sid }
+      _.up('ui_focus', {}, data)
+      _.up('tab_name_clicked', {}, { id, name })
+    }
+    function on_tab_close_click () {
+      el.remove()
+      delete variable_tabs[id]
+      register_actions()
+      const data = { type: 'tab', sid: opts.sid }
+      _.up('ui_focus', {}, data)
+      _.up('tab_close_clicked', {}, { id, name })
+      sync_tab_count()
+    }
+    entries.appendChild(el)
+    sync_separators()
+  }
+
+  function create_action (name, info, icon, run) {
+    return { name, info, icon, status: { hidden: true }, steps: [], run }
+  }
+
+  function register_actions () {
+    const tab_actions = Object.values(variable_tabs).flatMap(tab => tab.actions)
+    docs.register_actions(docs_actions.concat(tab_actions))
+  }
+
+  function create_separator () {
+    const sep = document.createElement('div')
+    sep.className = 'tab-separator'
+    sep.innerHTML = `
+      <svg width="2" height="24" viewBox="0 0 2 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <line x1="1" y1="2" x2="1" y2="22" stroke="#666666" stroke-width="1.5" stroke-linecap="round"/>
+      </svg>
+    `
+    return sep
+  }
+
+  function sync_separators () {
+    const existing_seps = entries.querySelectorAll(':scope > .tab-separator')
+    for (const sep of existing_seps) {
+      sep.remove()
+    }
+
+    const main_children = Array.from(entries.children).filter(child => {
+      if (child.style.display === 'none') return false
+      return child.classList.contains('tabsbtn') || 
+             child.classList.contains('nested-collapse-container') ||
+             child.classList.contains('tab-group-inline')
+    })
+
+    for (let i = 0; i < main_children.length - 1; i++) {
+      const sep = create_separator()
+      entries.insertBefore(sep, main_children[i].nextSibling)
+    }
+
+    if (nested_collapse_el) {
+      const group_children = Array.from(nested_collapse_el.children).filter(child => {
+        if (child.style.display === 'none') return false
+        return child.classList.contains('nested-group-container') ||
+               child.classList.contains('nested-group-leaf')
+      })
+
+      const existing_nested_seps = nested_collapse_el.querySelectorAll(':scope > .tab-separator')
+      for (const sep of existing_nested_seps) {
+        sep.remove()
+      }
+
+      for (let i = 0; i < group_children.length - 1; i++) {
+        const sep = create_separator()
+        nested_collapse_el.insertBefore(sep, group_children[i].nextSibling)
+      }
+    }
+  }
+
+  async function onbatch (batch) {
+    for (const { type, paths } of batch) {
+      const data = await Promise.all(paths.map(load_path_raw))
+      const func = on[type] || fail
+      func(data, type)
+    }
+    if (!init) {
+      if (!opts.ids) variables.forEach(create_btn)
+      init = true
+    } else {
+    }
+
+    function load_path_raw (path) { return drive.get(path).then(read_drive_file_raw) }
+    function read_drive_file_raw (file) { return file.raw }
+  }
+  function fail (data, type) { console.warn('invalid message', { cause: { data, type } }) }
+  function inject (data) { sheet.replaceSync(data[0]) }
+
+  function onvariables (data) {
+    const vars = typeof data[0] === 'string' ? JSON.parse(data[0]) : data[0]
+    variables = vars
+  }
+
+  function iconject (data) {
+    dricons = data
+    ARROW_LEFT_SVG = data[4] || ''
+    ARROW_RIGHT_SVG = data[5] || ''
+    SEPARATOR_SVG = data[6] || ''
+  }
+
+  function update_scroll_position () {
+  }
+
+  function onscroll (data) {
+    setTimeout(apply_scroll_position, 200)
+    function apply_scroll_position () {
+      if (entries) {
+        entries.scrollLeft = data
+      }
+    }
+  }
+}
+
+function fallback_module () {
+  return {
+    api: fallback_instance,
+    _: {
+      DOCS: {
+        $: ''
+      },
+      net_helper: {
+        $: ''
+      }
+    }
+  }
+  function fallback_instance () {
+    return {
+      _: {
+        DOCS: {
+          0: ''
+        },
+        net_helper: {
+          0: ''
+        }
+      },
+      drive: {
+        'icons/': {
+          'cross.svg': {
+            $ref: 'cross.svg'
+          },
+          '1.svg': {
+            $ref: 'icon.svg'
+          },
+          '2.svg': {
+            $ref: 'icon.svg'
+          },
+          '3.svg': {
+            $ref: 'icon.svg'
+          },
+          '4.svg': {
+            $ref: 'arrow-left.svg'
+          },
+          '5.svg': {
+            $ref: 'arrow-right.svg'
+          },
+          '6.svg': {
+            $ref: 'separator.svg'
+          }
+        },
+        'actions/': {
+          'commands.json': {
+            raw: JSON.stringify([
+              {
+                name: 'New Tab',
+                info: 'Create a new tab in the current tab strip.',
+                icon: 'plus',
+                status: {
+                  pinned: true,
+                  default: true
+                },
+                steps: [
+                  { name: 'Enter Tab Name', type: 'optional', is_completed: false, component: 'form_input', status: 'default', data: '' }
+                ]
+              },
+              {
+                name: 'Duplicate Tab',
+                info: 'Copy an existing tab and open the duplicate as a new tab.',
+                icon: 'copy',
+                status: {
+                  pinned: false,
+                  default: false
+                },
+                steps: [
+                  { name: 'Select Tab to Duplicate', type: 'mandatory', is_completed: false, component: 'form_input', status: 'default', data: '' },
+                  { name: 'Enter New Tab Name', type: 'optional', is_completed: false, component: 'form_input', status: 'default', data: '' }
+                ]
+              },
+              {
+                name: 'Close Tab',
+                info: 'Close the selected tab after confirmation.',
+                icon: 'close',
+                status: {
+                  pinned: false,
+                  default: true
+                },
+                steps: [
+                  { name: 'Select Tab to Close', type: 'mandatory', is_completed: false, component: 'form_input', status: 'default', data: '' },
+                  { name: 'Confirm Close', type: 'mandatory', is_completed: false, component: 'form_input', status: 'default', data: '' }
+                ]
+              }
+            ])
+          }
+        },
+        'variables/': {
+          'tabs.json': {
+            $ref: 'tabs.json'
+          }
+        },
+        'scroll/': {
+          'position.json': {
+            raw: '100'
+          }
+        },
+        'docs/': {
+          'README.md': {
+            $ref: 'README.md'
+          }
+        },
+        'style/': {
+          'theme.css': {
+            $ref: 'style.css'
+          }
+        }
+      }
+    }
+  }
+}
+
+}).call(this)}).call(this,"/node_modules/ui-components/src/node_modules/tabs/tabs.js")
+},{"DOCS":6,"STATE":1,"net_helper":18}],25:[function(require,module,exports){
+(function (__filename){(function (){
+const STATE = require('STATE')
+const state_db = STATE(__filename)
+const { get } = state_db(fallback_module)
+const DOCS = require('DOCS')
+const net = require('net_helper')
+
+const tabs_component = require('tabs')
+const task_manager = require('task_manager')
+
+module.exports = tabsbar
+
+async function tabsbar (opts, invite) {
+  const { id, sdb } = await get(opts.sid)
+  const { drive } = sdb
+
+  const on = {
+    style: inject,
+    icons: inject_icons
+  }
+
+  let dricons = {}
+  let docs_toggle_active = false
+  const on_message = {
+    docs_toggle: handle_docs_toggle,
+    add_link_tab: handle_forward_tabs,
+    remove_link_tab: handle_forward_tabs,
+    show_collapsed_tab_group: handle_forward_tabs,
+    hide_collapsed_tab_group: handle_forward_tabs,
+    tile_focus_changed: handle_forward_tabs,
+    restore_tab: handle_forward_tabs,
+  }
+  const { io, _ } = net(id)
+  const el = document.createElement('div')
+  const shadow = el.attachShadow({ mode: 'closed' })
+  const docs = DOCS(__filename)(opts.sid)
+  const actions_file = await drive.get('actions/command.json')
+  const actions = actions_file.raw
+    ? (typeof actions_file.raw === 'string' ? JSON.parse(actions_file.raw) : actions_file.raw)
+    : []
+  const focus_hat_action = {
+    name: 'Focus Wizard Hat',
+    info: 'Focus the wizard hat.',
+    icon: 'hat',
+    status: { hidden: true },
+    steps: [],
+    run: focus_wizard_hat
+  }
+  docs.register_actions(actions.concat(focus_hat_action))
+  on_hat_click.info = focus_hat_action.info
+
+  io.on = {
+    up: io_up(),
+    tabs: io_tabs(),
+    task_manager: io_task_manager()
+  }
+  if (invite) {
+    io.accept(invite)
+    const data = {
+      type: 'wizard_hat',
+      sid: opts.sid
+    }
+    _.up('ui_focus', {}, data)
+  }
+
+  shadow.innerHTML = `
+  <div class="tabs-bar-container main">
+  <button class="hat-btn"></button>
+  <tabs></tabs>
+  <task-manager></task-manager>
+  <button class="bar-btn"></button>
+  </div>`
+  const sheet = new CSSStyleSheet()
+  shadow.adoptedStyleSheets = [sheet]
+  const hat_btn = shadow.querySelector('.hat-btn')
+  const bar_btn = shadow.querySelector('.bar-btn')
+
+  const subs = await sdb.watch(onbatch)
+
+  function onload (svg) {
+    const parser = new DOMParser()
+    const doc = parser.parseFromString(svg, 'image/svg+xml')
+    const svgElem = doc.documentElement
+    hat_btn.replaceChildren(svgElem)
+    hat_btn.onclick = docs.wrap_isolated(on_hat_click)
+  }
+  if (dricons[0]) {
+    onload(dricons[0])
+  }
+  if (dricons[2]) {
+    const parser = new DOMParser()
+    const doc = parser.parseFromString(dricons[2], 'image/svg+xml')
+    const svgElem = doc.documentElement
+    bar_btn.replaceChildren(svgElem)
+    bar_btn.onclick = on_bar_btn_click
+
+    function on_bar_btn_click () {
+      docs_toggle_active = !docs_toggle_active
+      // Send message to root module to set docs mode
+      _.up('set_docs_mode', {}, { active: docs_toggle_active })
+      // Also send docs_toggle notification for UI updates
+      _.up('docs_toggle', {}, { active: docs_toggle_active })
+      bar_btn.classList.toggle('active', docs_toggle_active)
+      _.task_manager('docs_toggle', {}, { active: docs_toggle_active })
+    }
+  }
+  const tabs = await tabs_component({ ...subs[0] }, io.invite('tabs', { up: id }))
+  tabs.classList.add('tabs-bar')
+  shadow.querySelector('tabs').replaceWith(tabs)
+
+  const task_mgr = await task_manager({ ...subs[1] }, io.invite('task_manager', { up: id }))
+  task_mgr.classList.add('bar-btn')
+  shadow.querySelector('task-manager').replaceWith(task_mgr)
+
+  return el
+
+  function io_up () {
+    return function onmessage (msg) {
+      const handler = on_message[msg.type] || onmessage_fail
+      handler(msg)
+    }
+  }
+
+  function on_hat_click (event, $) { $('Focus Wizard Hat') }
+  function focus_wizard_hat () { _.up('ui_focus', {}, { type: 'wizard_hat', sid: opts.sid }) }
+
+  function handle_docs_toggle (msg) { _.tabs(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+  function handle_forward_tabs (msg) { _.tabs(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+
+  function onmessage_fail () {
+    // Handle other message types
+  }
+
+  function io_tabs () {
+    return function tabs_protocol (msg) {
+      const action_handlers = {
+        update_tab_count: tabs_update_tab_count
+      }
+      const handler = action_handlers[msg.type] || tabs_forward_up
+      handler(msg)
+
+      function tabs_update_tab_count (msg) { _.task_manager(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+      function tabs_forward_up (msg) { _.up(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+    }
+  }
+
+  function io_task_manager () {
+    return function task_manager_protocol (msg) { _.up(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+  }
+
+  async function onbatch (batch) {
+    for (const { type, paths } of batch) {
+      const data = await Promise.all(paths.map(load_path_raw))
+      const func = on[type] || fail
+      func(data, type)
+    }
+
+    function load_path_raw (path) { return drive.get(path).then(read_drive_file_raw) }
+    function read_drive_file_raw (file) { return file.raw }
+  }
+
+  function fail (data, type) { console.warn('invalid message', { cause: { data, type } }) }
+  function inject (data) { sheet.replaceSync(data[0]) }
+  function inject_icons (data) { dricons = data }
+}
+
+function fallback_module () {
+  return {
+    api: fallback_instance,
+    _: {
+      tabs: {
+        $: ''
+      },
+      task_manager: {
+        $: ''
+      },
+      DOCS: {
+        $: ''
+      },
+      net_helper: {
+        $: ''
+      }
+    }
+  }
+
+  function fallback_instance () {
+    return {
+      _: {
+        tabs: {
+          0: '',
+          mapping: {
+            icons: 'icons',
+            variables: 'variables',
+            scroll: 'scroll',
+            style: 'style',
+            docs: 'docs',
+            actions: 'actions'
+          }
+        },
+        task_manager: {
+          0: '',
+          mapping: {
+            count: 'count',
+            style: 'style',
+            docs: 'docs',
+            actions: 'actions'
+          }
+        },
+        DOCS: {
+          0: ''
+        },
+        net_helper: {
+          0: ''
+        }
+      },
+      drive: {
+        'style/': {
+          'theme.css': {
+            raw: `
+              .tabs-bar-container {
+                display: flex;
+                flex: inherit;
+                flex-direction: row;
+                flex-wrap: nowrap;
+                align-items: stretch;
+              }
+              .tabs-bar {
+                display: flex;
+                flex: auto;
+                flex-direction: row;
+                flex-wrap: nowrap;
+                align-items: stretch;
+                width: 256px;
+              }
+              .hat-btn, .bar-btn {
+                display: flex;
+                min-width: 32px;
+                border: none;
+                background: #131315;
+                cursor: pointer;
+                flex-direction: row;
+                justify-content: center;
+                align-items: center;
+              }
+              .bar-btn.active {
+                background: #2d4a6d;
+              }
+            `
+          }
+        },
+        'icons/': {
+          '1.svg': {
+            $ref: 'hat.svg'
+          },
+          '2.svg': {
+            $ref: 'hat.svg'
+          },
+          '3.svg': {
+            $ref: 'docs.svg'
+          }
+        },
+        'actions/': {
+          'command.json': {
+            raw: JSON.stringify([
+              {
+                name: 'New File',
+                info: 'Create a new file after choosing its name and location.',
+                icon: 'file',
+                status: {
+                  pinned: true,
+                  default: true
+                },
+                steps: [
+                  {
+                    name: 'Enter File Name',
+                    type: 'mandatory',
+                    is_completed: false,
+                    component: 'input_test',
+                    status: 'default',
+                    data: '',
+                    commands: [
+                      { type: 'set_mode', data: { mode: 'search' } },
+                      { type: 'set_search_query', data: { query: 'file' } }
+                    ]
+                  },
+                  { name: 'Choose Location', type: 'mandatory', is_completed: false, component: 'form_input', status: 'default', data: '' }
+                ]
+              },
+              {
+                name: 'Open File',
+                info: 'Open an existing file from the selected location.',
+                icon: 'folder',
+                status: {
+                  pinned: false,
+                  default: true
+                },
+                steps: [
+                  {
+                    name: 'Select File',
+                    type: 'mandatory',
+                    is_completed: false,
+                    component: 'form_input',
+                    status: 'default',
+                    data: '',
+                    commands: [
+                      { type: 'set_mode', data: { mode: 'default' } },
+                      { type: 'clear_selection', data: {} }
+                    ]
+                  }
+                ]
+              },
+              {
+                name: 'Save File',
+                info: 'Save the current file to the chosen location and filename.',
+                icon: 'save',
+                status: {
+                  pinned: true,
+                  default: false
+                },
+                steps: [
+                  { name: 'Choose Location', type: 'mandatory', is_completed: false, component: 'form_input', status: 'default', data: '' },
+                  { name: 'Enter File Name', type: 'mandatory', is_completed: false, component: 'form_input', status: 'default', data: '' }
+                ]
+              },
+              {
+                name: 'Settings',
+                info: 'Open configuration controls for the current workspace.',
+                icon: 'gear',
+                status: {
+                  pinned: false,
+                  default: true
+                },
+                steps: [
+                  {
+                    name: 'Configure Settings',
+                    type: 'optional',
+                    is_completed: false,
+                    component: 'input_test',
+                    status: 'default',
+                    data: '',
+                    commands: [
+                      { type: 'set_flag', data: { flag_type: 'hubs', value: 'true' } }
+                    ]
+                  }
+                ]
+              },
+              {
+                name: 'Help',
+                info: 'Open documentation for the current workspace.',
+                icon: 'help',
+                status: {
+                  pinned: false,
+                  default: false
+                },
+                steps: [
+                  { name: 'View Documentation', type: 'optional', is_completed: false, component: 'form_input', status: 'default', data: '' }
+                ]
+              },
+              {
+                name: 'Terminal',
+                info: 'Open a terminal for the current workspace.',
+                icon: 'terminal',
+                status: {
+                  pinned: true,
+                  default: true
+                },
+                steps: [
+                  { name: 'Open Terminal', type: 'mandatory', is_completed: false, component: 'form_input', status: 'default', data: '' }
+                ]
+              },
+              {
+                name: 'Search',
+                info: 'Search actions or workspace content using the command UI.',
+                icon: 'search',
+                status: {
+                  pinned: false,
+                  default: true
+                },
+                steps: [
+                  {
+                    name: 'Enter Search Query',
+                    type: 'mandatory',
+                    is_completed: false,
+                    component: 'form_input',
+                    status: 'default',
+                    data: '',
+                    commands: [
+                      { type: 'set_mode', data: { mode: 'search' } },
+                      { type: 'set_search_query', data: { query: 'action' } }
+                    ]
+                  },
+                  {
+                    name: 'Select Scope',
+                    type: 'optional',
+                    is_completed: false,
+                    component: 'input_test',
+                    status: 'default',
+                    data: '',
+                    commands: [
+                      { type: 'set_flag', data: { flag_type: 'selection', value: 'default' } },
+                      { type: 'get_selected', data: {} }
+                    ]
+                  }
+                ]
+              },
+              {
+                name: 'Click Rate Test',
+                info: 'Start a 10-click gesture. Regular clicks are documented as events; the 10th click triggers the result action.',
+                icon: 'timer',
+                status: {
+                  pinned: false,
+                  default: true
+                },
+                steps: [
+                  {
+                    name: 'Click 10 Times',
+                    type: 'mandatory',
+                    is_completed: false,
+                    component: 'form_click_rate_test',
+                    status: 'default',
+                    data: ''
+                  }
+                ]
+              },
+              {
+                name: 'Split Tile',
+                info: 'Split the active tile in the selected direction.',
+                icon: 'split',
+                status: {
+                  pinned: false,
+                  default: true
+                },
+                steps: [
+                  {
+                    name: 'Choose Split Direction',
+                    type: 'mandatory',
+                    is_completed: false,
+                    component: 'form_tile_split_choice',
+                    status: 'default',
+                    data: ''
+                  }
+                ]
+              }
+            ])
+          }
+        },
+        'docs/': {
+          'README.md': {
+            $ref: 'README.md'
+          }
+        }
+      }
+    }
+  }
+}
+
+}).call(this)}).call(this,"/node_modules/ui-components/src/node_modules/tabsbar/tabsbar.js")
+},{"DOCS":6,"STATE":1,"net_helper":18,"tabs":24,"task_manager":26}],26:[function(require,module,exports){
+(function (__filename){(function (){
+const STATE = require('STATE')
+const statedb = STATE(__filename)
+const { get } = statedb(fallback_module)
+const DOCS = require('DOCS')
+const net = require('net_helper')
+
+module.exports = task_manager
+
+async function task_manager (opts, invite) {
+  const { id, sdb } = await get(opts.sid)
+  const { drive } = sdb
+
+  const docs = DOCS(__filename)(opts.sid)
+  const actions_file = await drive.get('actions/commands.json')
+  const actions = actions_file.raw
+    ? (typeof actions_file.raw === 'string' ? JSON.parse(actions_file.raw) : actions_file.raw)
+    : []
+
+  const on_message = {
+    update_tab_count: handle_update_count
+  }
+
+  const on = {
+    style: inject,
+    count: update_count
+  }
+  const { io, _ } = net(id)
+  const focus_action = {
+    name: 'Focus Task Manager',
+    info: 'Focus the task manager.',
+    icon: 'tasks',
+    status: { hidden: true },
+    steps: [],
+    run: focus_task_manager
+  }
+  docs.register_actions(actions.concat(focus_action))
+  on_task_manager_click.info = focus_action.info
+
+  const el = document.createElement('div')
+  const shadow = el.attachShadow({ mode: 'closed' })
+
+  shadow.innerHTML = `
+  <div class="task-manager-container main">
+    <button class="task-count-btn">0</button>
+  </div>`
+  const sheet = new CSSStyleSheet()
+  shadow.adoptedStyleSheets = [sheet]
+  const btn = shadow.querySelector('.task-count-btn')
+
+  io.on = {
+    up: io_up()
+  }
+  if (invite) io.accept(invite)
+
+  btn.onclick = docs.wrap_isolated(on_task_manager_click)
+
+  await sdb.watch(onbatch)
+
+  return el
+
+  function io_up () {
+    return function onmessage (msg) {
+      const handler = on_message[msg.type] || onmessage_fail
+      handler(msg)
+    }
+  }
+
+  function on_task_manager_click (event, $) { $('Focus Task Manager') }
+  function focus_task_manager () { _.up('ui_focus', {}, { type: 'task_manager', sid: opts.sid }) }
+
+  function handle_update_count (msg) { update_count(msg.data.count) }
+
+  async function onbatch (batch) {
+    for (const { type, paths } of batch) {
+      const data = await Promise.all(paths.map(load_path_raw))
+      const func = on[type] || fail
+      func(data, type)
+    }
+
+    function load_path_raw (path) { return drive.get(path).then(read_drive_file_raw) }
+    function read_drive_file_raw (file) { return file.raw }
+  }
+  function fail (data, type) { console.warn('invalid message', { cause: { data, type } }) }
+  function inject (data) { sheet.replaceSync(data[0]) }
+  function update_count (data) { if (btn) btn.textContent = data.toString() }
+}
+
+function fallback_module () {
+  return {
+    api: fallback_instance,
+    _: {
+      DOCS: {
+        $: ''
+      },
+      net_helper: {
+        $: ''
+      }
+    }
+  }
+
+  function fallback_instance () {
+    return {
+      _: {
+        DOCS: {
+          0: ''
+        },
+        net_helper: {
+          0: ''
+        }
+      },
+      drive: {
+        'style/': {
+          'theme.css': {
+            raw: `
+              .task-count-btn {
+                background: #2d2d2d;
+                color: #fff;
+                border: none;
+                border-radius: 100%;
+                padding: 4px 8px;
+                min-width: 24px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+              }
+              .task-count-btn:hover {
+                background: #3d3d3d;
+              }
+            `
+          }
+        },
+        'actions/': {
+          'commands.json': {
+            raw: JSON.stringify([
+              {
+                name: 'Kill Process',
+                info: 'Stop the selected running process after confirmation.',
+                icon: 'stop',
+                status: {
+                  pinned: false,
+                  default: true
+                },
+                steps: [
+                  { name: 'Select Process', type: 'mandatory', is_completed: false, component: 'form_input', status: 'default', data: '' },
+                  { name: 'Confirm Kill', type: 'mandatory', is_completed: false, component: 'form_input', status: 'default', data: '' }
+                ]
+              },
+              {
+                name: 'Restart Task',
+                info: 'Restart the selected task after confirmation.',
+                icon: 'refresh',
+                status: {
+                  pinned: true,
+                  default: false
+                },
+                steps: [
+                  { name: 'Select Task', type: 'mandatory', is_completed: false, component: 'form_input', status: 'default', data: '' },
+                  { name: 'Confirm Restart', type: 'mandatory', is_completed: false, component: 'form_input', status: 'default', data: '' }
+                ]
+              },
+              {
+                name: 'Task Details',
+                info: 'Open details for the selected task.',
+                icon: 'info',
+                status: {
+                  pinned: false,
+                  default: true
+                },
+                steps: [
+                  { name: 'Select Task', type: 'mandatory', is_completed: false, component: 'form_input', status: 'default', data: '' },
+                  { name: 'View Details', type: 'optional', is_completed: false, component: 'form_input', status: 'default', data: '' }
+                ]
+              }
+            ])
+          }
+        },
+        'count/': {
+          'value.json': {
+            raw: '3'
+          }
+        },
+        'docs/': {
+          'README.md': {
+            $ref: 'README.md'
+          }
+        }
+      }
+    }
+  }
+}
+
+}).call(this)}).call(this,"/node_modules/ui-components/src/node_modules/task_manager/task_manager.js")
+},{"DOCS":6,"STATE":1,"net_helper":18}],27:[function(require,module,exports){
+(function (__filename){(function (){
+const STATE = require('STATE')
+const statedb = STATE(__filename)
+const { get } = statedb(fallback_module)
+const net = require('net_helper')
+const action_bar = require('action_bar')
+const action_executor = require('action_executor')
+const tabsbar = require('tabsbar')
+
+module.exports = taskbar
+
+async function taskbar (opts, invite) {
+  const { id, sdb } = await get(opts.sid)
+  const { drive } = sdb
+
+  const on = {
+    style: inject
+  }
+  const on_message = {
+    update_steps_wizard_for_app: handle_update_steps_wizard_for_app,
+    docs_toggle: handle_docs_toggle,
+    load_actions: handle_load_actions,
+    step_clicked: handle_step_clicked,
+    update_quick_actions_for_app: handle_update_quick_actions_for_app,
+    update_quick_actions_input: handle_update_quick_actions_input,
+    show_submit_btn: handle_submit_btn_toggle,
+    hide_submit_btn: handle_submit_btn_toggle,
+    add_link_tab: handle_forward_tabsbar,
+    remove_link_tab: handle_forward_tabsbar,
+    show_collapsed_tab_group: handle_forward_tabsbar,
+    hide_collapsed_tab_group: handle_forward_tabsbar,
+    tile_focus_changed: handle_forward_tabsbar,
+    restore_tab: handle_forward_tabsbar
+  }
+  const { io, _ } = net(id)
+
+  const el = document.createElement('div')
+  const shadow = el.attachShadow({ mode: 'closed' })
+
+  shadow.innerHTML = `
+  <div class="taskbar-container main">
+    <div class="action-executor-slot"></div>
+    <div class="bottom-slot">
+      <div class="action-bar-slot"></div>
+      <div class="tabsbar-slot"></div>
+    </div>
+  </div>`
+  const sheet = new CSSStyleSheet()
+  shadow.adoptedStyleSheets = [sheet]
+  const action_executor_slot = shadow.querySelector('.action-executor-slot')
+  const action_bar_slot = shadow.querySelector('.action-bar-slot')
+  const tabsbar_slot = shadow.querySelector('.tabsbar-slot')
+
+  const subs = await sdb.watch(onbatch)
+  io.on = {
+    up: io_up(),
+    action_bar: io_action_bar(),
+    action_executor: io_action_executor(),
+    tabsbar: io_tabsbar()
+  }
+  if (invite) io.accept(invite)
+
+  const action_bar_el = await action_bar({ ...subs[0] }, io.invite('action_bar', { up: id }))
+  action_bar_el.classList.add('replaced-action-bar')
+  action_bar_slot.replaceWith(action_bar_el)
+
+  const action_executor_el = await action_executor({ ...subs[1] }, io.invite('action_executor', { up: id }))
+  action_executor_el.classList.add('replaced-action-executor')
+  action_executor_slot.replaceWith(action_executor_el)
+
+  const tabsbar_el = await tabsbar({ ...subs[2] }, io.invite('tabsbar', { up: id }))
+  tabsbar_el.classList.add('replaced-tabsbar')
+  tabsbar_slot.replaceWith(tabsbar_el)
+
+  return el
+
+  async function onbatch (batch) {
+    for (const { type, paths } of batch) {
+      const data = await Promise.all(paths.map(load_path_raw))
+      const func = on[type] || fail
+      func({ data, type })
+    }
+
+    function load_path_raw (path) { return drive.get(path).then(read_drive_file_raw) }
+    function read_drive_file_raw (file) { return file.raw }
+  }
+
+  function fail ({ data, type }) { console.warn('invalid message', { cause: { data, type } }) }
+
+  function inject ({ data }) { sheet.replaceSync(data[0]) }
+
+  // ---------
+  // PROTOCOLS
+  // ---------
+
+  function io_action_bar () {
+    return function action_bar_protocol (msg) {
+      const action_handlers = {
+        action_submitted: action_bar_forward_action_executor,
+        selected_action: action_bar_forward_action_executor,
+        activate_steps_wizard: action_bar_forward_action_executor,
+        render_form: action_bar_forward_action_executor,
+        console_history_toggle: action_bar_forward_up,
+        ui_focus: action_bar_forward_up,
+        display_actions: action_bar_forward_up,
+        filter_actions: action_bar_forward_up
+      }
+      const handler = action_handlers[msg.type] || action_bar_forward_up
+      handler(msg)
+
+      function action_bar_forward_action_executor (msg) { _.action_executor(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+      function action_bar_forward_up (msg) { _.up(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+    }
+  }
+
+  function io_action_executor () {
+    return function action_executor_protocol (msg) {
+      console.error('taskbar: action_executor_protocol', msg.type, msg.data)
+      const action_handlers = {
+        load_actions: action_executor__forward_action_bar,
+        step_clicked: action_executor__forward_action_bar,
+        show_submit_btn: action_executor__forward_action_bar,
+        hide_submit_btn: action_executor__forward_action_bar,
+        action_auto_completed: action_executor__auto_completed
+      }
+      const handler = action_handlers[msg.type] || action_executor__noop
+      handler(msg)
+      _.up(msg.type, msg.head ? { cause: msg.head } : {}, msg.data)
+
+      function action_executor__forward_action_bar (msg) { _.action_bar(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+      function action_executor__noop () {}
+
+      function action_executor__auto_completed (msg) { _.action_bar('action_submitted', msg.head ? { cause: msg.head } : {}, msg.data) }
+    }
+  }
+
+  function io_tabsbar () {
+    return function tabsbar_protocol (msg) {
+      const action_handlers = {
+        docs_toggle: tabsbar_docs_toggle,
+        link_tab_close_clicked: tabsbar_forward_up,
+        link_tab_clicked: tabsbar_forward_up,
+        tab_group_tile_clicked: tabsbar_forward_up
+      }
+      const handler = action_handlers[msg.type] || tabsbar__noop
+      handler(msg)
+      _.up(msg.type, msg.head ? { cause: msg.head } : {}, msg.data)
+
+      function tabsbar_docs_toggle (msg) {
+        _.action_bar(msg.type, msg.head ? { cause: msg.head } : {}, msg.data)
+        _.action_executor(msg.type, msg.head ? { cause: msg.head } : {}, msg.data)
+      }
+
+      function tabsbar_forward_up (msg) { _.up(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+      function tabsbar__noop () {}
+    }
+  }
+
+  function io_up () {
+    return function onmessage (msg) {
+      const handler = on_message[msg.type] || onmessage_forward_action_bar
+      handler(msg)
+    }
+  }
+
+  function handle_update_steps_wizard_for_app (msg) { _.action_executor(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+  function handle_docs_toggle (msg) { _.action_bar(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+  function handle_load_actions (msg) { _.action_bar(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+  function handle_step_clicked (msg) { _.action_bar(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+  function handle_update_quick_actions_for_app (msg) { _.action_bar(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+  function handle_update_quick_actions_input (msg) { _.action_bar(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+  function handle_submit_btn_toggle (msg) { _.action_bar(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+  function handle_forward_tabsbar (msg) { _.tabsbar(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+  function onmessage_forward_action_bar (msg) { _.action_bar(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+}
+
+function fallback_module () {
+  return {
+    api: fallback_instance,
+    _: {
+      action_bar: {
+        $: ''
+      },
+      action_executor: {
+        $: ''
+      },
+      tabsbar: {
+        $: ''
+      },
+      net_helper: {
+        $: ''
+      }
+    }
+  }
+
+  function fallback_instance () {
+    return {
+      _: {
+        action_bar: {
+          0: '',
+          mapping: {
+            icons: 'icons',
+            style: 'style',
+            variables: 'variables',
+            data: 'data',
+            actions: 'actions',
+            hardcons: 'hardcons',
+            prefs: 'prefs',
+            docs: 'docs'
+          }
+        },
+        action_executor: {
+          0: '',
+          mapping: {
+            style: 'style',
+            variables: 'variables',
+            docs: 'docs',
+            data: 'data'
+          }
+        },
+        tabsbar: {
+          0: '',
+          mapping: {
+            icons: 'icons',
+            style: 'style',
+            docs: 'docs',
+            actions: 'actions'
+          }
+        },
+        net_helper: {
+          0: ''
+        }
+      },
+      drive: {
+        'style/': {
+          'theme.css': {
+            raw: `
+              .taskbar-container {
+                display: flex;
+                background: #2d2d2d;
+                column-gap: 1px;
+                flex-direction: column;
+                align-content: center;
+                justify-content: center;
+                container-type: inline-size;
+              }
+              .replaced-tabsbar {
+                display: flex;
+                flex: auto;
+              }
+              .replaced-action-bar {
+                display: flex;
+                flex-direction: column;
+                justify-content: center;
+                align-items: flex-start;
+                background: #131315;
+              }
+              .replaced-action-executor {
+                display: flex;
+              }
+              .bottom-slot {
+                display: flex;
+                flex-direction: row;
+                justify-content: space-between;
+              }
+              @container (max-width: 768px) {
+                .bottom-slot {
+                  flex-direction: column;
+                }
+              }
+            `
+          }
+        },
+        'icons/': {},
+        'variables/': {},
+        'data/': {},
+        'actions/': {},
+        'hardcons/': {},
+        'prefs/': {},
+        'docs/': {
+          'README.md': {
+            $ref: 'README.md'
+          }
+        }
+      }
+    }
+  }
+}
+
+}).call(this)}).call(this,"/node_modules/ui-components/src/node_modules/taskbar/taskbar.js")
+},{"STATE":1,"action_bar":7,"action_executor":8,"net_helper":18,"tabsbar":25}],28:[function(require,module,exports){
+(function (__filename){(function (){
+const STATE = require('STATE')
+const statedb = STATE(__filename)
+const { get } = statedb(fallback_module)
+const net = require('net_helper')
+
+const program_container = require('program_container')
+const taskbar = require('taskbar')
+
+module.exports = theme_widget
+
+async function theme_widget (opts, invite) {
+  const { id, sdb } = await get(opts.sid)
+  const { drive } = sdb
+
+  const on = {
+    style: inject,
+    focused: handle_focused
+  }
+
+  // Inline focus tracking (merged from focus_tracker)
+  let last_focused = null
+  const { io, _ } = net(id)
+
+  const el = document.createElement('div')
+  const shadow = el.attachShadow({ mode: 'closed' })
+  shadow.innerHTML = `
+  <div class="theme-widget main">
+    <div class="program-container-slot"></div>
+    <div class="taskbar-slot"></div>
+  </div>
+  `
+  const sheet = new CSSStyleSheet()
+  shadow.adoptedStyleSheets = [sheet]
+  const program_container_slot = shadow.querySelector('.program-container-slot')
+  const taskbar_slot = shadow.querySelector('.taskbar-slot')
+
+  const subs = await sdb.watch(onbatch)
+
+  let program_container_el = null
+  let taskbar_el = null
+  io.on = {
+    up: io_up(),
+    program_container: io_program_container(),
+    taskbar: io_taskbar()
+  }
+  if (invite) io.accept(invite)
+
+  taskbar_el = await taskbar({ ...subs[1] }, io.invite('taskbar', { up: id }))
+  taskbar_el.classList.add('taskbar')
+  taskbar_slot.replaceWith(taskbar_el)
+
+  program_container_el = await program_container({ ...subs[0] }, io.invite('program_container', { up: id }))
+  program_container_el.classList.add('program-container')
+  program_container_slot.replaceWith(program_container_el)
+
+  return el
+
+  async function onbatch (batch) {
+    for (const { type, paths } of batch) {
+      const data = await Promise.all(paths.map(load_path_raw))
+      const func = on[type] || fail
+      func({ data, type })
+    }
+
+    function load_path_raw (path) { return drive.get(path).then(read_drive_file_raw) }
+    function read_drive_file_raw (file) { return file.raw }
+  }
+
+  function inject ({ data }) { sheet.replaceSync(data[0]) }
+
+  // Inline focus tracker: reads persisted focused value to keep last_focused in sync
+  function handle_focused ({ data }) {
+    const focused = typeof data[0] === 'string' ? JSON.parse(data[0]) : data[0]
+    last_focused = focused.value
+  }
+
+  function fail ({ data, type }) { console.warn('invalid message', { cause: { data, type } }) }
+
+  function io_up () {
+    return function onmessage_from_root (msg) {
+      const action_handlers = {
+        update_actions_for_app: root_update_actions_for_app,
+        update_quick_actions_for_app: root_forward_taskbar,
+        update_steps_wizard_for_app: root_forward_taskbar,
+        tile_focus_changed: root_forward_taskbar,
+        show_collapsed_tab_group: root_forward_taskbar,
+        hide_collapsed_tab_group: root_forward_taskbar
+      }
+      const handler = action_handlers[msg.type] || fail
+      handler(msg)
+
+      function root_update_actions_for_app (msg) {
+        if (_.program_container) _.program_container(msg.type, msg.head ? { cause: msg.head } : {}, msg.data)
+        else setTimeout(root_retry_send_program_container, 500, msg)
+      }
+
+      function root_retry_send_program_container (msg) { _.program_container(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+      function root_forward_taskbar (msg) { _.taskbar(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+    }
+  }
+
+  // Inline focus tracker: handles ui_focus messages from children
+  function handle_ui_focus (msg) {
+    if (last_focused !== msg.data.type) {
+      _.up('focused_app_changed', {}, msg.data)
+    }
+    drive.put('focused/current.json', { value: msg.data.type })
+  }
+
+  // ---------
+  // PROTOCOLS
+  // ---------
+  function io_program_container () {
+    return function program_container_protocol (msg) {
+      const action_handlers = {
+        ui_focus: program_container_forward_ui_focus,
+        set_doc_display_handler: program_container_forward_up,
+        action_auto_completed: program_container_forward_up,
+        action_complete: program_container_forward_up
+      }
+      const handler = action_handlers[msg.type] || program_container_forward_taskbar
+      handler(msg)
+
+      function program_container_forward_ui_focus (msg) { handle_ui_focus(msg) }
+      function program_container_forward_up (msg) { _.up(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+      function program_container_forward_taskbar (msg) { _.taskbar(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+    }
+  }
+
+  function io_taskbar () {
+    return function taskbar_protocol (msg) {
+      const action_handlers = {
+        ui_focus: taskbar_forward_ui_focus,
+        docs_toggle: taskbar_docs_toggle,
+        set_docs_mode: taskbar_forward_up,
+        action_auto_completed: taskbar_forward_up,
+        action_complete: taskbar_forward_up,
+        link_tab_close_clicked: taskbar_forward_up,
+        link_tab_clicked: taskbar_forward_up,
+        tab_group_tile_clicked: taskbar_forward_up
+      }
+      const handler = action_handlers[msg.type] || taskbar_forward_program_container
+      handler(msg)
+
+      function taskbar_forward_ui_focus (msg) { handle_ui_focus(msg) }
+      function taskbar_forward_up (msg) { _.up(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+      function taskbar_forward_program_container (msg) { _.program_container(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+      function taskbar_docs_toggle (msg) { _.program_container(msg.type, msg.head ? { cause: msg.head } : {}, msg.data) }
+    }
+  }
+}
+
+function fallback_module () {
+  return {
+    api: fallback_instance,
+    _: {
+      program_container: {
+        $: ''
+      },
+      taskbar: {
+        $: ''
+      },
+      net_helper: {
+        $: ''
+      }
+    },
+    drive: {}
+  }
+
+  function fallback_instance () {
+    return {
+      _: {
+        program_container: {
+          0: '',
+          mapping: {
+            style: 'style',
+            icons: 'icons',
+            commands: 'commands',
+            scroll: 'scroll',
+            actions: 'actions',
+            hardcons: 'hardcons',
+            files: 'files',
+            highlight: 'highlight',
+            active_tab: 'active_tab',
+            entries: 'entries',
+            runtime: 'runtime',
+            mode: 'mode',
+            flags: 'flags',
+            keybinds: 'keybinds',
+            undo: 'undo',
+            focused: 'focused',
+            temp_actions: 'temp_actions',
+            temp_quick_actions: 'temp_quick_actions',
+            prefs: 'prefs',
+            variables: 'variables',
+            data: 'data',
+            docs: 'docs',
+            docs_style: 'docs_style'
+          }
+        },
+        taskbar: {
+          0: '',
+          mapping: {
+            style: 'style',
+            icons: 'icons',
+            actions: 'actions',
+            prefs: 'prefs',
+            variables: 'variables',
+            data: 'data',
+            hardcons: 'hardcons',
+            docs: 'docs'
+          }
+        },
+        net_helper: {
+          0: ''
+        }
+      },
+      drive: {
+        'style/': {
+          'theme.css': {
+            raw: `
+              .theme-widget {
+                display: flex;
+                flex-direction: column;
+                width: 100%;
+                height: 100%;
+                background: #131315;
+                min-height: 0;
+                min-width: 400px;
+              }
+              .program-container {
+                flex: 1 1 auto;
+                min-height: 0;
+                height: 100%;
+              }
+              .taskbar {
+                flex: 0 0 auto;
+                width: 100%;
+                z-index: 10;
+              }
+            `
+          }
+        },
+        'flags/': {},
+        'commands/': {},
+        'icons/': {},
+        'scroll/': {},
+        'actions/': {},
+        'hardcons/': {},
+        'files/': {},
+        'highlight/': {},
+        'active_tab/': {},
+        'entries/': {},
+        'runtime/': {},
+        'mode/': {},
+        'keybinds/': {},
+        'undo/': {},
+        'focused/': {
+          'current.json': {
+            raw: { value: 'default' }
+          }
+        },
+        'temp_actions/': {},
+        'temp_quick_actions/': {},
+        'prefs/': {},
+        'variables/': {},
+        'data/': {},
+        'docs_style/': {},
+        'docs/': {
+          'README.md': {
+            $ref: 'README.md'
+          }
+        }
+      }
+    }
+  }
+}
+
+}).call(this)}).call(this,"/node_modules/ui-components/src/node_modules/theme_widget/theme_widget.js")
+},{"STATE":1,"net_helper":18,"program_container":20,"taskbar":27}],29:[function(require,module,exports){
+(function (__filename){(function (){
+const STATE = require('STATE')
+const statedb = STATE(__filename)
+statedb.admin()
+const { sdb, id } = statedb(defaults)
+const { drive } = sdb
+const net = require('net_helper')
+const DOCS = require('DOCS')
+const docs_admin = DOCS(__filename)().admin
+
+const topnav = require('topnav')
+const header = require('header')
+const footer = require('footer')
+const theme_widget = require('theme_widget')
+// site sections, in page order
+const sections = { topnav, header, footer }
+
+module.exports = app
+
+async function app () {
+  const on = {
+    style: inject,
+    devkit: show_devkit
+  }
+  const el = document.createElement('div')
+  const shadow = el.attachShadow({ mode: 'closed' })
+  shadow.innerHTML = `
+  <div class="wrap site"></div>
+  <aside class="devkit"></aside>
+  <button class="devkit-toggle">devkit</button>`
+  const sheet = new CSSStyleSheet()
+  shadow.adoptedStyleSheets = [sheet]
+  document.adoptedStyleSheets = [sheet]
+  const site = shadow.querySelector('.site')
+  const devkit = shadow.querySelector('.devkit')
+  const toggle = shadow.querySelector('.devkit-toggle')
+  toggle.onclick = ontoggle_click
+  const status = { devkit_open: false }
+
+  const { io, _ } = net(id)
+  io.on = { theme_widget: io_theme_widget() }
+  for (const name of Object.keys(sections)) io.on[name] = io_section(name)
+
+  const subs = await sdb.watch(onbatch)
+
+  for (const [name, make] of Object.entries(sections)) {
+    const sub = find_sub(name)
+    if (!sub) { console.error(`app: no sub found for "${name}"`); continue }
+    site.append(await make({ ...sub }, io.invite(name, { app: id })))
+  }
+  const devkit_sub = find_sub('theme_widget')
+  if (devkit_sub) devkit.append(await theme_widget({ ...devkit_sub }, io.invite('theme_widget', { up: id })))
+  else console.error('app: no sub found for "theme_widget", devkit will not render')
+
+  return el
+
+  // subs are found by type, not by position, so a different order from STATE can't mix them up
+  function find_sub (name) { return subs.find(sub => sub.type && sub.type.endsWith(`>${name}`)) }
+
+  async function onbatch (batch) {
+    for (const { type, paths } of batch) {
+      const data = await Promise.all(paths.map(path => drive.get(path).then(file => file.raw)))
+      const func = on[type] || fail
+      func(data, type)
+    }
+  }
+  function fail (data, type) { console.warn('app: invalid batch', { cause: { data, type } }) }
+  function inject (data) { sheet.replaceSync(data.join('\n')) }
+  function show_devkit ([state]) {
+    const { open } = typeof state === 'string' ? JSON.parse(state) : state
+    status.devkit_open = open
+    el.classList.toggle('devkit-open', open)
+    toggle.textContent = open ? 'close devkit' : 'devkit'
+  }
+  function ontoggle_click () {
+    drive.put('devkit/state.json', { open: !status.devkit_open })
+  }
+
+  function io_section (name) {
+    return function onmessage_from_section (msg) {
+      const handlers = { jump }
+      const handler = handlers[msg.type] || fail_message
+      handler(msg)
+    }
+  }
+  function jump (msg) {
+    const { to } = msg.data
+    if (to === 'top') return window.scrollTo({ top: 0, behavior: 'smooth' })
+    if (!sections[to]) return console.info(`app: section "${to}" is not on the page yet`)
+    _[to]('scroll', { cause: msg.head })
+  }
+
+  function io_theme_widget () {
+    return function onmessage_from_devkit (msg) {
+      const handlers = {
+        set_docs_mode: msg => docs_admin.set_docs_mode(msg.data.active),
+        set_doc_display_handler: msg => docs_admin.set_doc_display_handler(msg.data.callback),
+        focused_app_changed: send_actions
+      }
+      const handler = handlers[msg.type] || fail_message
+      handler(msg)
+    }
+  }
+  function send_actions (msg) {
+    const actions = get_actions(msg.data.sid)
+    const refs = { cause: msg.head }
+    _.theme_widget('update_actions_for_app', refs, actions)
+    _.theme_widget('update_quick_actions_for_app', refs, actions)
+    _.theme_widget('update_steps_wizard_for_app', refs, actions)
+  }
+  // DOCS throws for a sid without registered actions (DOCS/index.js:45), the site sections have none yet
+  function get_actions (sid) {
+    try { return docs_admin.get_actions(sid) } catch (e) { return [] }
+  }
+  function fail_message (msg) { console.warn('app: unhandled message', msg) }
+}
+
+function defaults () {
+  const section = {
+    $: '',
+    0: '',
+    mapping: { style: 'style', content: 'content' }
+  }
+  const devkit_datasets = [
+    'commands', 'icons', 'scroll', 'actions', 'hardcons', 'files', 'highlight',
+    'active_tab', 'entries', 'runtime', 'mode', 'flags', 'keybinds', 'undo',
+    'focused', 'temp_actions', 'temp_quick_actions', 'prefs', 'variables',
+    'data', 'docs_style', 'docs'
+  ]
+  const mapping = { style: 'style' }
+  const drive = {
+    'style/': {
+      'demo.css': { $ref: 'node_modules/css/default/demo.css' },
+      'app.css': { $ref: 'node_modules/css/default/app.css' },
+      'devkit.css': { $ref: 'node_modules/css/default/devkit.css' }
+    },
+    'content/': {},
+    // tabs inside devkit maps a "count" dataset up to the root
+    'count/': {},
+    'devkit/': {
+      'state.json': { raw: { open: true } }
+    }
+  }
+  for (const name of devkit_datasets) {
+    mapping[name] = name
+    drive[`${name}/`] = {}
+  }
+  return {
+    _: {
+      net_helper: 0,
+      DOCS: 0,
+      topnav: section,
+      header: section,
+      footer: section,
+      theme_widget: { $: '', 0: '', mapping }
+    },
+    drive
   }
 }
 
 }).call(this)}).call(this,"/src/app.js")
-},{"STATE":3,"footer":4,"header":9,"io":10,"theme_widget":14,"topnav":16}],3:[function(require,module,exports){
-const localdb = require('localdb')
-const io = require('io')
-
-let db
-/** Data stored in a entry in db by STATE (Schema): 
- * id (String): Node Path 
- * name (String/Optional): Any (To be used in theme_widget)
- * type (String): Module Name for module / Module id for instances
- * hubs (Array): List of hub-nodes
- * subs (Array): List of sub-nodes
- * inputs (Array): List of input files
- */
-// Constants and initial setup (global level)
-const VERSION = 13
-const HELPER_MODULES = ['io', 'localdb', 'STATE']
-const FALLBACK_POST_ERROR = '\nFor more info visit https://github.com/alyhxn/playproject/blob/main/doc/state/temp.md#defining-fallbacks'
-const FALLBACK_SYNTAX_POST_ERROR = '\nFor more info visit https://github.com/alyhxn/playproject/blob/main/doc/state/temp.md#key-descriptions'
-const FALLBACK_SUBS_POST_ERROR = '\nFor more info visit https://github.com/alyhxn/playproject/blob/main/doc/state/temp.md#shadow-dom-integration'
-const status = {
-  root_module: true, 
-  root_instance: true, 
-  overrides: {},
-  tree: {},
-  tree_pointers: {},
-  modulepaths: {},
-  addresses: {},
-  inits: [],
-  open_branches: {},
-  db,
-  local_statuses: {},
-  listeners: {},
-  missing_supers: new Set(),
-  imports: {},
-  expected_imports: {},
-  used_ids: new Set(),
-  a2i: {},
-  i2a: {},
-  s2i: {},
-  i2s: {},
-  services: {},
-  args: {},
-  callbacks: [],
-  root_datasets: [],
-  dataset_types: {},
-  helpers: {
-    listify
-  }
-}
-window.STATEMODULE = status
-
-
-
-// Symbol mappings
-let admins = [0]
-
-// Inner Function
-function STATE (address, modulepath, dependencies) {
-  status.modulepaths[modulepath] = 0
-  status.addresses[modulepath] = address
-  //Variables (module-level)
-  
-  const local_status = {
-    name: extract_filename(address),
-    module_id: modulepath,
-    deny: {},
-    sub_modules: [],
-    sub_instances: {}
-  }
-  status.local_statuses[modulepath] = local_status
-  if(status.ROOT_ID)
-    return statedb
-  const sdb = statedb
-  sdb.admin = admin
-  return sdb
-  
-  function admin (imported_db = localdb) {
-    db = imported_db()
-    status.db = db
-    // Version check and initialization
-    status.fallback_check = Boolean(check_version())
-    status.fallback_check && db.add(['playproject_version'], VERSION)
-    status.ROOT_ID = modulepath
-    return { on }
-    function on (callback) {
-      status.callback = callback
-    }
-  }
-  function statedb (fallback) {
-    if(!status.ROOT_ID)
-      throw new Error('Admin access required! Call statedb.admin() first.' + FALLBACK_POST_ERROR)
-
-    const data = fallback(status.args[modulepath], { listify: tree => listify(tree, modulepath), tree: status.tree_pointers[modulepath] })
-    local_status.fallback_instance = data.api
-    const super_id = modulepath.split(/>(?=[^>]*$)/)[0]
-    
-    if(super_id === status.current_node)
-      status.expected_imports[super_id].splice(status.expected_imports[super_id].indexOf(modulepath), 1)
-    else if((status?.current_node?.split('>').length || 0) < super_id.split('>').length){
-      let temp = super_id
-      while(temp !== status.current_node && temp.includes('>')){
-        status.open_branches[temp] = 0
-        temp = temp.split(/>(?=[^>]*$)/)[0]
-      }
-    }
-    else{
-      let temp = status.current_node
-      while(temp !== super_id && temp.includes('>')){
-        status.open_branches[temp] = 0
-        temp = temp.split(/>(?=[^>]*$)/)[0]
-      }
-    }
-
-    if(data._){
-      status.open_branches[modulepath] = Object.values(data._).filter(node => node).length
-      status.expected_imports[modulepath] = Object.keys(data._)
-      status.current_node = modulepath
-    }
-
-    local_status.fallback_module = new Function(`return ${fallback.toString()}`)()
-    verify_imports(modulepath, dependencies, data)
-    const updated_status = append_tree_node(modulepath, status)
-    Object.assign(status.tree_pointers, updated_status.tree_pointers)
-    Object.assign(status.open_branches, updated_status.open_branches)
-    status.inits.push(init_module)
-    
-    // console.log(Object.values(status.open_branches).reduce((acc, curr) => acc + curr, 0))
-    if(!Object.values(status.open_branches).reduce((acc, curr) => acc + curr, 0)){
-      status.inits.forEach(init => init())
-    }
-    
-    const sdb = create_statedb_interface(local_status, modulepath, xtype = 'module')
-    sdb.id = modulepath
-    status.dataset = sdb.private_api
-
-    const get = init_instance
-    const extra_fallbacks = Object.entries(local_status.fallback_instance || {})
-    extra_fallbacks.length && extra_fallbacks.forEach(([key]) => {
-      get[key] = (sid) => get(sid, key)
-    })
-    if(!status.a2i[modulepath]){
-      status.i2a[status.a2i[modulepath] = encode(modulepath)] = modulepath
-    }
-    
-    try {
-      status.callback && status.callback({ type: 'create sdb', data: modulepath })
-      return {
-      id: modulepath,
-      sdb: sdb.public_api,
-      get: init_instance,
-      io: io(status.a2i[modulepath], modulepath, status.callback)
-      // sub_modules
-    }
-    } catch (error) {
-      throw new Error(`ID: ${modulepath}\n`+error)
-    }
-    
-  }
-  function append_tree_node (id, status) {
-    const [super_id, name] = id.split(/>(?=[^>]*$)/)
-
-    if(Object.keys(status.tree).length){
-      if(status.tree_pointers[super_id]){
-        status.tree_pointers[super_id]._[name] = { $: { _: {} } }
-        status.tree_pointers[id] = status.tree_pointers[super_id]._[name].$
-        status.open_branches[super_id]--
-      }
-      else{
-        let new_name = name
-        let new_super_id = super_id
-
-
-        while(!status.tree_pointers[new_super_id]){
-          [new_super_id, temp_name] = new_super_id.split(/>(?=[^>]*$)/)
-          new_name = temp_name + '>' + new_name
-        }
-        status.tree_pointers[new_super_id]._[new_name] = { $: { _: {} } }
-        status.tree_pointers[id] = status.tree_pointers[new_super_id]._[new_name].$
-        if(!status.missing_supers.has(super_id))
-          status.open_branches[new_super_id]--
-        status.missing_supers.add(super_id)
-      }
-    }
-    else{
-      status.tree[id] = { $: { _: {} } }
-      status.tree_pointers[id] = status.tree[id].$
-    }
-    return status
-  }
-  function init_module () {
-    const {statedata, state_entries, newstatus, updated_local_status} = get_module_data(local_status.fallback_module)
-    statedata.orphan && (local_status.orphan = true)
-    //side effects
-    if (status.fallback_check) {
-      Object.assign(status.root_module, newstatus.root_module)
-      Object.assign(status.overrides, newstatus.overrides)
-      console.log('Main module: ', statedata.id, '\n', state_entries)
-      updated_local_status && Object.assign(local_status, updated_local_status)
-      // console.log('Local status: ', local_status.fallback_instance, statedata.api)
-      const old_fallback = local_status.fallback_instance
-      
-      if(local_status.fallback_instance ? local_status.fallback_instance?.toString() === statedata.api?.toString() : false)
-        local_status.fallback_instance = statedata.api
-      else
-        local_status.fallback_instance = (args, tools) => {
-          return statedata.api(args, tools, [old_fallback])
-        }
-      const extra_fallbacks = Object.entries(old_fallback || {})
-      extra_fallbacks.length && extra_fallbacks.forEach(([key, value]) => {
-        local_status.fallback_instance[key] = (args, tools) => {
-          console.log('Extra fallback: ', statedata.api[key] ? statedata.api[key] : old_fallback[key])
-          return (statedata.api[key] ? statedata.api[key] : old_fallback[key])(args, tools, [value])
-        }
-      })
-      db.append(['state'], state_entries)
-      db.add(['root_datasets'], [
-        { name: 'state' }
-      ])
-      // add_source_code(statedata.inputs) // @TODO: remove side effect
-    }
-    [local_status.sub_modules, symbol2ID, ID2Symbol, address2ID, ID2Address] = symbolfy(statedata, local_status)
-    Object.assign(status.s2i, symbol2ID)
-    Object.assign(status.i2s, ID2Symbol)
-    Object.assign(status.a2i, address2ID)
-    Object.assign(status.i2a, ID2Address)
-    
-    //Setup local data (module level)
-    if(status.root_module){
-      status.root_module = false
-      statedata.admins && admins.push(...statedata.admins)
-    }
-    // @TODO: handle sub_modules when dynamic require is implemented
-    // const sub_modules = {}
-    // statedata.subs && statedata.subs.forEach(id => {
-    //   sub_modules[db.read(['state', id]).type] = id
-    // })
-  }
-  function init_instance (sid, fallback_key) {
-    const fallback = local_status.fallback_instance[fallback_key] || local_status.fallback_instance
-    const {statedata, state_entries, newstatus} = get_instance_data(sid, fallback)
-    
-    if (status.fallback_check) {
-      Object.assign(status.root_module, newstatus.root_module)
-      Object.assign(status.overrides, newstatus.overrides)
-      Object.assign(status.tree, newstatus.tree)
-      console.log('Main instance: ', statedata.id, '\n', state_entries)
-      db.append(['state'], state_entries)
-    }
-    [local_status.sub_instances[statedata.id], symbol2ID, ID2Symbol, address2ID, ID2Address] = symbolfy(statedata, local_status)
-    Object.assign(status.s2i, symbol2ID)
-    Object.assign(status.i2s, ID2Symbol)
-    Object.assign(status.a2i, address2ID)
-    Object.assign(status.i2a, ID2Address)
-    
-    const sdb = create_statedb_interface(local_status, statedata.id, xtype = 'instance')
-    sdb.id = statedata.id
-
-    const sanitized_event = {}
-    statedata.net && Object.keys(statedata.net).forEach(node => {
-      statedata.net[node].id = status.a2i[node] || (status.a2i[node] = encode(node))
-    })
-
-    status.callback && status.callback({ type:'create sdb', data:statedata.id })
-    return {
-      id: statedata.id,
-      net: statedata.net,
-      sdb: sdb.public_api,
-      io: io(status.a2i[statedata.id], modulepath, status.callback),
-    }
-  }
-  function get_module_data (fallback) {
-    let data = db.read(['state', modulepath])
-    if (status.fallback_check) {
-      if (data) {
-        var {sanitized_data, updated_status} = preprocess({ fun_status: status, fallback, xtype: 'module', pre_data: data })
-      } 
-      else if (status.root_module) {
-        var {sanitized_data, updated_status} = preprocess({ fun_status: status, fallback, xtype: 'module', pre_data: {id: modulepath}})
-      } 
-      else {
-        var {sanitized_data, updated_status, updated_local_status} = find_super({ xtype: 'module', fallback, fun_status:status, local_status })
-      }
-      data = sanitized_data.entry
-    }
-    return {
-      statedata: data,
-      state_entries: sanitized_data?.entries,
-      newstatus: updated_status,
-      updated_local_status
-    }
-  }
-  function get_instance_data (sid, fallback) {
-    let id = status.s2i[sid]
-    if(id && (id.split(':')[0] !== modulepath || !id.includes(':')))
-        throw new Error(`Access denied! Wrong SID '${id}' used by instance of '${modulepath}'` + FALLBACK_SUBS_POST_ERROR)
-    if(status.used_ids.has(id))
-      throw new Error(`Access denied! SID '${id}' is already used` + FALLBACK_SUBS_POST_ERROR)
-
-    id && status.used_ids.add(id)
-    let data = id && db.read(['state', id])
-    let sanitized_data, updated_status = status
-    if (status.fallback_check) {
-      if (!data && !status.root_instance) {
-        ({sanitized_data, updated_status} = find_super({ xtype: 'instance', fallback, fun_status: status }))
-      } else {
-        ({sanitized_data, updated_status} = preprocess({
-          fun_status: status,
-          fallback, 
-          xtype: 'instance',
-          pre_data: data || {id: get_instance_path(modulepath)}
-        }))
-        updated_status.root_instance = false
-      }
-      data = sanitized_data.entry
-    }
-    else if (status.root_instance) {
-      data = db.read(['state', id || get_instance_path(modulepath)])
-      updated_status.tree = JSON.parse(JSON.stringify(status.tree))
-      updated_status.root_instance = false
-    }
-    
-    if (!data && local_status.orphan) {
-      data = db.read(['state', get_instance_path(modulepath)])
-    }
-    return {
-      statedata: data,
-      state_entries: sanitized_data?.entries,
-      newstatus: updated_status,
-    }
-  }
-  function find_super ({ xtype, fallback, fun_status, local_status }) {
-    let modulepath_super = modulepath.split(/\>(?=[^>]*$)/)[0]
-    let modulepath_grand = modulepath_super.split(/\>(?=[^>]*$)/)[0]
-    if(status.modulepaths[modulepath_super] !== undefined){
-      throw new Error(`Node "${modulepath}" is not defined in the fallback of "${modulepath_super}"` + FALLBACK_SUBS_POST_ERROR)
-    }
-    const split = modulepath.split('>')
-    let data
-    const entries = {}
-    if(xtype === 'module'){
-      let name = split.at(-1)
-      while(!data && modulepath_grand.includes('>')){
-        data = db.read(['state', modulepath_super])
-        const split = modulepath_super.split(/\>(?=[^>]*$)/)
-        modulepath_super = split[0]
-        name = split[1] + '>' + name
-      }
-      console.log(data)
-      data.path = data.id = modulepath_super + '>' + name
-      modulepath = modulepath_super + '>' + name
-      local_status.name = name
-
-      const super_data = db.read(['state', modulepath_super])
-      super_data.subs.forEach((sub_id, i) => {
-        if(sub_id === modulepath_super){
-          super_data.subs.splice(i, 1)
-          return
-        }
-      })
-      super_data.subs.push(data.id)
-      entries[super_data.id] = super_data
-    }
-    else{
-      //@TODO: Make the :0 dynamic
-      let instance_path_super = modulepath_super + ':0'
-      let temp
-      while(!data && temp !== modulepath_super){
-        data = db.read(['state', instance_path_super])
-        temp = modulepath_super
-        modulepath_grand = modulepath_super = modulepath_super.split(/\>(?=[^>]*$)/)[0]
-        instance_path_super = modulepath_super + ':0'
-      }
-      data.path = data.id = get_instance_path(modulepath)
-      temp = null
-      let super_data
-      let instance_path_grand = modulepath_grand.includes('>') ? modulepath_grand + ':0' : modulepath_grand
-
-      while(!super_data?.subs && temp !== modulepath_grand){
-        super_data = db.read(['state', instance_path_grand])
-        temp = modulepath_grand
-        modulepath_grand = modulepath_grand.split(/\>(?=[^>]*$)/)[0]
-        instance_path_grand = modulepath_grand.includes('>') ? modulepath_grand + ':0' : modulepath_grand
-      }
-      
-      super_data.subs.forEach((sub_id, i) => {
-        if(sub_id === instance_path_super){
-          super_data.subs.splice(i, 1)
-          return
-        }
-      })
-      super_data.subs.push(data.id)
-      entries[super_data.id] = super_data
-    }
-    data.name = split.at(-1)
-    return { updated_local_status: local_status,
-      ...preprocess({ 
-      fun_status,
-      fallback, xtype, 
-      pre_data: data, 
-      orphan_check: true, entries }) }
-  }
-  function preprocess ({ fallback, xtype, pre_data = {}, orphan_check, fun_status, entries }) {
-    const used_keys = new Set()
-    let {id: pre_id, hubs: pre_hubs, mapping} = pre_data
-    const fallback_args = [status.args[pre_id], { listify: tree => listify(tree, modulepath), tree: status.tree_pointers[modulepath] }]
-    let fallback_data = fallback(...fallback_args)
-    try {
-      validate(fallback_data, xtype)
-    } catch (error) {
-      throw new Error(`in fallback function of ${pre_id} ${xtype}\n${error.stack}`)
-    }
-    const overrides = fun_status.overrides[pre_id]
-    if(overrides){
-      // console.log('Before: ', JSON.parse(JSON.stringify(fallback_data)))
-      const override = overrides.fun.shift()
-      fallback_data = override(...fallback_args, get_fallbacks({ fallback_data, overrides: overrides.fun, modulepath, instance_path: pre_id }))
-      // console.log('After: ', JSON.parse(JSON.stringify(fallback_data)))
-      console.log('Override used: ', pre_id, overrides.by, )
-      overrides.by.splice(0, 1)
-      overrides.fun.splice(0, 1)
-    }
-    
-    // console.log('fallback_data: ', fallback)
-    fun_status.overrides = register_overrides({ overrides: fun_status.overrides, tree: fallback_data, path: modulepath, id: pre_id, address })
-    console.log('overrides: ', Object.keys(fun_status.overrides))
-    orphan_check && (fallback_data.orphan = orphan_check)
-    //This function makes changes in fun_status (side effect)
-    return {
-      sanitized_data: sanitize_state({ local_id: '', entry: fallback_data, path: pre_id, xtype, mapping, entries }),
-      updated_status: fun_status
-    }
-    
-    function sanitize_state ({ local_id, entry, path, hub_entry, local_tree, entries = {}, xtype, mapping, xkey }) {
-      [path, entry, local_tree] = extract_data({ local_id, entry, path, hub_entry, local_tree, xtype, xkey })
-
-      entry.id =  path
-      entry.name = entry.name || local_id.split(':')[0] || local_status.name
-      mapping && (entry.mapping = mapping)
-      
-      entries = {...entries, ...sanitize_subs({ local_id, entry, path, local_tree, xtype, mapping })}
-      delete entry._
-      entries[entry.id] = entry
-      // console.log('Entry: ', entry)
-      return {entries, entry}
-    }
-    function extract_data ({ local_id, entry, path, hub_entry, xtype, xkey }) {
-      if (local_id) {
-        entry.hubs = [hub_entry.id]
-        if (xtype === 'instance') {
-          let temp_path = path.split(':')[0]
-          temp_path = temp_path ? temp_path + '>' : temp_path
-          const module_id = temp_path + local_id
-          entry.type = module_id
-          path = module_id + ':' + xkey
-          temp = Number(xkey)+1
-          temp2 = db.read(['state', path])
-          while(temp2 || used_keys.has(path)){
-            path = module_id + ':' + temp
-            temp2 = db.read(['state', path])
-            temp++
-          }
-        }
-        else {
-          entry.type = local_id
-          path = path ? path + '>' : ''
-          path = path + local_id
-        }
-      } 
-      else {
-        if (xtype === 'instance') {
-          entry.type = local_status.module_id
-        } else {
-          local_tree = JSON.parse(JSON.stringify(entry))
-          // @TODO Handle JS file entry
-          // console.log('pre_id:', pre_id)
-          // const file_id = local_status.name + '.js'
-          // entry.drive || (entry.drive = {})
-          // entry.drive[file_id] = { $ref: address }
-          entry.type = local_status.name
-        }
-        pre_hubs && (entry.hubs = pre_hubs)
-      }
-      return [path, entry, local_tree]
-    }
-    function sanitize_subs ({ local_id, entry, path, local_tree, xtype, mapping }) {
-      const entries = {}
-      if (!local_id) {
-        entry.subs = []
-
-        if (entry.drive) {
-          // entry.drive.theme && (entry.theme = entry.drive.theme)
-          // entry.drive.lang && (entry.lang = entry.drive.lang)
-          entry.inputs = []
-          const new_drive = []
-          const map_drive = {}
-          const path_def = {}
-          Object.entries(entry.drive).forEach(([dataset_type, dataset]) => {
-            if(dataset_type.split('/')[1]){
-              path_def[dataset_type] = dataset
-              return
-            }
-            dataset_type = dataset_type.split('/')[0]
-
-            const new_dataset = { files: [], mapping: {}, name: 'default' }
-            Object.entries(dataset).forEach(([key, value]) => {
-              new_dataset.files.push(append_file(key, value, entry, entries))
-            })
-            new_dataset.id = entry.id + '.default.' + dataset_type + '.dataset'
-            Object.assign(new_dataset, fill_dataset(new_dataset, dataset_type))
-            activate_dataset(new_dataset, dataset_type)
-            new_drive.push(new_dataset.id)
-
-          })
-          if (Object.keys(path_def).length) {
-            Object.entries(path_def).forEach(([path, value]) =>{
-              const [dataset_type, file_name] = path.split('/')
-              const new_dataset = map_drive[dataset_type] || (map_drive[dataset_type] = { files: [], mapping: {}, name: 'default' })
-              
-              if(!new_dataset.id){
-                new_dataset.id = entry.id + '.default.' + dataset_type + '.dataset'
-                if(new_drive.includes(new_dataset.id)){
-                  console.warn(`Both JSON and path definitions used for dataset "${dataset_type}" in the drive of "${entry.id}"`)
-                  return
-                }
-                Object.assign(new_dataset, fill_dataset(new_dataset, dataset_type))
-              }
-              new_dataset.files.push(append_file(file_name, value, entry, entries))
-              activate_dataset(new_dataset, dataset_type)
-            })
-            new_drive.push(...Object.values(map_drive).map(dataset => dataset.id))
-          }
-          entry.drive = new_drive
-        }
-        else
-          entry.drive = []
-
-        if(entry._){
-          //@TODO refactor when fallback structure improves
-          Object.entries(entry._).forEach(([local_id, value]) => {
-            value.mapping = sanitize_mapping(value.mapping)
-            Object.entries(value).forEach(([key, override]) => {
-              if(key === 'mapping' || (key === '$' && xtype === 'instance'))
-                return
-              const sub_instance = sanitize_state({ local_id, entry: value, path, hub_entry: entry, local_tree, xtype: key === '$' ? 'module' : 'instance', mapping: value['mapping'], xkey: key }).entry
-              entries[sub_instance.id] = JSON.parse(JSON.stringify(sub_instance))
-              entry.subs.push(sub_instance.id)
-              used_keys.add(sub_instance.id)
-            })
-        })}
-
-      }
-      return entries
-
-      function append_file (key, value, entry, entries) {
-        const sanitized_file = sanitize_file(key, value, entry, entries)
-        entries[sanitized_file.id] = sanitized_file
-        return sanitized_file.id
-      }
-      function fill_dataset (dataset, dataset_type) {
-        dataset.type = status.dataset_types[dataset_type] || dataset_type
-        dataset.xtype = dataset_type
-        dataset.id = db.gen_id(dataset.id)
-        dataset.node_id = entry.id
-        entries[dataset.id] = dataset
-      }
-      function activate_dataset (dataset, dataset_type) {
-        let check_name = true
-        entry.inputs.forEach(dataset_id => {
-          const ds = entries[dataset_id]
-          if(ds.type === dataset.type)
-            check_name = false
-        })
-        check_name && entry.inputs.push(dataset.id)
-
-        if(status.root_module)
-          fun_status.root_datasets.push(dataset.type)
-        else {
-          const hub_entry = db.read(['state', entry.hubs[0]])
-          if(!hub_entry.inputs)
-            throw new Error(`Node "${hub_entry.id}" has no "drive" defined in its fallback` + FALLBACK_SUBS_POST_ERROR)
-          if(!mapping?.[dataset_type])
-            throw new Error(`No mapping found for dataset "${dataset_type}" of subnode "${entry.id}" in node "${hub_entry.id}"\nTip: Add a mapping prop for "${dataset.type}" dataset in "${hub_entry.id}"'s fallback for "${entry.id}"` + FALLBACK_POST_ERROR)
-          const mapped_file_type = mapping[dataset.type]
-          hub_entry.inputs.some(input_id => {
-            const input = db.read(['state', input_id])
-            if(mapped_file_type === input.type){
-              input.mapping[entry.id] = dataset.id
-              entries[input_id] = input
-              return
-            }
-          })
-        }
-      }
-      function sanitize_mapping (mapping) {
-        if(!mapping)
-          return mapping
-        console.log('Sanitizing mapping: ', mapping, entry.id)
-        const new_mapping = mapping
-        Object.entries(mapping).forEach(([key, value]) => {
-          if(status.root_datasets.includes(value)){
-            fun_status.dataset_types[key] = value
-          }
-          else if(status.dataset_types[value]){
-            new_mapping[key] = status.dataset_types[value]
-            fun_status.dataset_types[key] = status.dataset_types[value]
-          }
-          else
-            throw new Error(`Mapped dataset "${value}" of "${entry.id}" can't be mapped to any root datasets` + FALLBACK_POST_ERROR)
-        })
-        return new_mapping
-      }
-    }
-    function sanitize_file (file_id, file, entry, entries) {
-      const type = file_id.split('.').at(-1)
-
-      if (!isNaN(Number(file_id))) return file_id
-
-      const raw_id = local_status.name + '.' + type
-      file.id = raw_id
-      file.name = file.name || file_id
-      file.type = type
-      file[file.type === 'js' ? 'subs' : 'hubs'] = [entry.id]
-      if(file.$ref){
-        file.address = file.address || address
-      }
-      file.id = db.gen_id(file.id)
-      while(entries[file.id]){
-        const no = file.id.split(':')[1]
-        file.id = raw_id + ':' + (Number(no || 0) + 1)
-      }
-      return file
-    }
-  }
-}
-
-// External Function (helper)
-function validate (data, xtype) {
-  /**  Expected structure and types
-   * Sample : "key1|key2:*:type1|type2"
-   * ":" : separator
-   * "|" : OR
-   * "*" : Required key
-   * */
-  const expected_structure = {
-    'api::function': () => {},
-    '_::object': {
-      ":*:object|number": {
-        ":*:function|string|object": '',
-        "mapping::": {}
-      }
-    },
-    'drive::object': {
-      "::object": {
-        "::object|string": { // Required key, any name allowed
-          "raw|$ref:*:object|string": {}, // data or $ref are names, required, object or string are types
-          "$ref": "string",
-          "address": "string",
-        }
-      },
-    },
-    'net::object': {}
-  }
-
-  validate_shape(data, expected_structure)
-
-  function validate_shape (obj, expected, super_node = 'root', path = '') {
-    const keys = Object.keys(obj)
-    const values = Object.values(obj)
-    let strict = Object.keys(expected).length
-
-    const all_keys = []
-    Object.entries(expected).forEach(([expected_key, expected_value]) => {
-      let [expected_key_names, required, expected_types] = expected_key.split(':')
-      expected_types = expected_types ? expected_types.split('|') : [typeof(expected_value)]
-      let absent = true
-      if(expected_key_names)
-        expected_key_names.split('|').forEach(expected_key_name => {
-          const value = obj[expected_key_name]
-          if(value !== undefined){
-            all_keys.push(expected_key_name)
-            const type = typeof(value)
-            absent = false
-
-            if(expected_types.includes(type))
-              type === 'object' && validate_shape(value, expected_value, expected_key_name, path + '/' + expected_key_name)
-            else
-              throw new Error(`Type mismatch: Expected "${expected_types.join(' or ')}" got "${type}" for key "${expected_key_name}" at:` + path + FALLBACK_POST_ERROR)
-          }
-        })
-      else{
-        strict = false
-        values.forEach((value, index) => {
-          absent = false
-          const type = typeof(value)
-
-          if(expected_types.includes(type))
-            type === 'object' && validate_shape(value, expected_value, keys[index], path + '/' + keys[index])
-          else
-            throw new Error(`Type mismatch: Expected "${expected_types.join(' or ')}" got "${type}" for key "${keys[index]}" at: ` + path + FALLBACK_POST_ERROR)
-        })
-      }
-      if(absent && required){
-        if(expected_key_names)
-          throw new Error(`Can't find required key "${expected_key_names.replace('|', ' or ')}" at: ` + path + FALLBACK_POST_ERROR)
-        else
-          throw new Error(`No sub-nodes found for super key "${super_node}" at sub: ` + path + FALLBACK_POST_ERROR)
-      }
-    })
-
-    strict && keys.forEach(key => {
-      if(!all_keys.includes(key)){
-        throw new Error(`Unknown key detected: '${key}' is an unknown property at: ${path || 'root'}` + FALLBACK_POST_ERROR)
-      }
-    })
-  }
-}
-function extract_filename (address) {
-  const parts = address.split('/node_modules/')
-  const last = parts.at(-1).split('/')
-  if(last.at(-1) === 'index.js')
-    return last.at(-2)
-  return last.at(-1).slice(0, -3)
-}
-function get_instance_path (modulepath, modulepaths = status.modulepaths) {
-  return modulepath + ':' + modulepaths[modulepath]++
-}
-async function get_input ({ id, name, $ref, type, raw, address }) {
-  const xtype = (typeof(id) === "number" ? name : id).split('.').at(-1)
-  let result = db.read(['state', id])?.raw
-  if (!result) {
-    if (raw === undefined){
-      // Patch: Prepend GitHub project name if running on GitHub Pages
-      let github_project = ''
-      if (typeof window !== 'undefined' && window.location.hostname.endsWith('github.io')) {
-        const path_parts = window.location.pathname.split('/').filter(Boolean)
-        if (path_parts.length > 0 && !$ref.startsWith('/' + path_parts[0])) {
-          github_project = '/' + path_parts[0] + ($ref.startsWith('/') ? '' : '/')
-        }
-      }
-      const ref = github_project + address.substring(0, address.lastIndexOf("/")) + '/'  + $ref
-      const response = await fetch(ref, { cache: 'no-store' })
-
-      if (!response.ok) 
-        throw new Error(`Failed to fetch data from '${ref}' for '${id}'` + FALLBACK_SYNTAX_POST_ERROR)
-      else
-        result = await response[xtype === 'json' ? 'json' : 'text']()
-    }
-    else
-      result = raw
-    db.add(['state', id], { id, name, type, address, $ref, raw: result })
-  }
-  return result
-}
-function compare(before, after, address) {
-  if (typeof after !== "object" || after === null) return after
-
-  for (const key in after) {
-    if (key === "$ref") {
-      if (!before || before[key] !== after[key]) {
-        //@TODO: What if before is from an override not fallback
-        after.address = address
-      }
-    } else {
-      after[key] = compare(before ? before[key] : undefined, after[key], address)
-    }
-  }
-  return after
-}
-//Unavoidable side effect
-function add_source_code (hubs) {
-  hubs.forEach(async id => {
-    const data = db.read(['state', id])
-    if (data.type === 'js') {
-      data.data = await get_input(data)
-      db.add(['state', data.id], data)
-      return
-    }
-  })
-}
-function verify_imports (id, imports, data) {
-  const state_address = imports.find(imp => imp.includes('STATE'))
-  HELPER_MODULES.push(state_address)
-  imports = imports.filter(imp => !HELPER_MODULES.includes(imp))
-  if(!data._){
-    if(imports.length > 1){
-      imports.splice(imports.indexOf(state_address), 1)
-      throw new Error(`No sub-nodes found for required modules "${imports.join(', ')}" in the fallback of "${status.local_statuses[id].module_id}"` + FALLBACK_POST_ERROR)
-    }
-    else return
-  }
-  const fallback_imports = Object.keys(data._)
-
-  imports.forEach(imp => {
-    let check = true
-    fallback_imports.forEach(fallimp => {
-      if(imp === fallimp)
-        check = false
-    })
-
-    if(check)
-      throw new Error('Required module "'+imp+'" is not defined in the fallback of '+status.local_statuses[id].module_id + FALLBACK_POST_ERROR)
-  })
-  
-  fallback_imports.forEach(fallimp => {
-    let check = true
-    imports.forEach(imp => {
-      if(imp === fallimp)
-        check = false
-    })
-    
-    if(check)
-      throw new Error('Module "'+fallimp+'" defined in the fallback of '+status.local_statuses[id].module_id+' is not required')
-  })
-
-}
-function symbolfy (data) {
-  const i2s = {}
-  const s2i = {}
-  const i2a = {}
-  const a2i = {}
-  const subs = []
-  data.subs && data.subs.forEach(sub => {
-    const substate = db.read(['state', sub])
-    i2a[a2i[sub] = encode(sub)] = sub
-    s2i[i2s[sub] = Symbol(a2i[sub])] = sub
-    subs.push({ sid: i2s[sub], type: substate.type })
-  })
-  return [subs, s2i, i2s, a2i, i2a]
-}
-function encode(text) {
-  let code = ''
-  while (code.length < 10) {
-    for (let i = 0; i < text.length && code.length < 10; i++) {
-      code += Math.floor(10 + Math.random() * 90)
-    }
-  }
-  return code
-}
-function listify(tree, prefix = '') {
-  if (!tree)
-    return []
-  
-  const result = []
-
-  function walk(current, prefix = '') {
-    for (const key in current) {
-      if (key === '$' && current[key]._ && typeof current[key]._ === 'object') {
-        walk(current[key]._, prefix)
-      } else {
-        const path = prefix ? `${prefix}>${key}` : key
-        result.push(path)
-        if (current[key]?.$?._ && typeof current[key].$._ === 'object') {
-          walk(current[key].$._, path)
-        }
-      }
-    }
-  }
-
-  if (tree._ && typeof tree._ === 'object') {
-    walk(tree._, prefix)
-  }
-
-  return result
-}
-function register_overrides ({overrides, address, ...args}) {
-  const { id: root_id } = args
-  recurse(args)
-  return overrides
-  function recurse ({ tree, path = '', id, xtype = 'instance', local_modulepaths = {} }) {
-
-    tree._ && Object.entries(tree._).forEach(([type, instances]) => {
-      const sub_path = path + '>' + type
-      Object.entries(instances).forEach(([id, branch]) => {
-        const resultant_path = id === '$' ? sub_path : sub_path + ':' + id
-        if(typeof(branch) === 'function'){
-          const override = mutate
-          function mutate (...all) {
-            const before = JSON.parse(JSON.stringify(all[2][0]()))
-            const after = compare(before, branch(...all), address)
-            if(after.api){
-              const api = after.api
-              after.api = (...all) => {
-                const before = JSON.parse(JSON.stringify(all[2][0]()))
-                return compare(before, api(...all), address)
-              }
-            }
-            return after
-          }
-          if(overrides[resultant_path]){
-            overrides[resultant_path].fun.push(override)
-            overrides[resultant_path].by.push(root_id)
-          }
-          else
-            overrides[resultant_path] = {fun: [override], by: [root_id]}
-        }
-        else if ( ['object', 'string'].includes(typeof(branch)) && id !== 'mapping' && branch._ === undefined)
-          status.args[resultant_path] = structuredClone(branch)
-        else
-          recurse({ tree: branch, path: sub_path, id, xtype, local_modulepaths })
-      })
-    })
-  }
-}
-function get_fallbacks ({ fallback_data, overrides, modulepath, instance_path }) {
-  return [mutated_fallback, ...overrides]
-    
-  function mutated_fallback () {
-    const data = fallback_data
-
-    merge_trees(data, modulepath)
-    return data
-
-    function merge_trees (data, path) {
-      if (data._) {
-        Object.entries(data._).forEach(([type, data]) => merge_trees(data, path + '>' + type.split('$')[0].replace('.', '>')))
-      } else {
-        data.$ = { _: status.tree_pointers[path]?._ }
-      }
-    }
-  }
-}
-function check_version () {
-  if (db.read(['playproject_version']) != VERSION) {
-    db.wash()
-    return true
-  }
-}
-function download (data, name) {
-  const dataStr = JSON.stringify(data, null, 2)
-  const blob = new Blob([dataStr], { type: 'application/json' })
-  const a = document.createElement('a')
-  a.href = URL.createObjectURL(blob)
-  a.download = `${name}.json`
-  a.click()
-}
-// Public Function
-function create_statedb_interface (local_status, node_id, xtype) {
-  const drive = {
-        get: (path) => get(path), has: (path) => has(path), 
-        put: (path, buffer) => put(path, buffer), list: (path) => list(path)
-      }
-  const admin_drive = { get, has, put, list }
-  const api =  {
-    public_api: {
-      watch, get_sub, drive, get: get_drive
-    },
-    private_api: {
-      drive: admin_drive,
-      xget: (id) => db.read(['state', id]),
-      get_all: () => db.read_all(['state']),
-      get_dataset,
-      register,
-      load: (snapshot) => {
-        db.wash()
-        Object.entries(snapshot).forEach(([key, value]) => {
-          db.add([key], JSON.parse(value), true)
-        })
-        window.location.reload()
-      },
-      swtch,
-      unregister,
-      status,
-      export_db,
-      import_db,
-      export_root,
-      import_root,
-      register_callback
-    }
-  }
-  node_id === status.ROOT_ID && (api.public_api.admin = api.private_api)
-  return api
-
-  async function watch (listener, on) {
-    if(on)
-      status.services[node_id] = Object.keys(on)
-    const data = db.read(['state', node_id])
-    if(listener){
-      (status.listeners[data.id] = status.listeners[data.id] || []).push(listener)
-      await listener(await make_input_map(data.inputs))
-    }
-    return xtype === 'module' ? local_status.sub_modules : local_status.sub_instances[node_id]
-  }
-  function register_callback (callbacks) {
-    status.callbacks.push(...callbacks)
-  }
-  function export_db (result) {
-    const datasets = get_dataset(result)
-    result.dataset = {}
-    datasets.forEach(dataset_id => {
-      const dataset = db.read(['state', dataset_id])
-      const node_id = dataset.node_id
-      const files = dataset.files || []
-      result.dataset[node_id] = {}
-      files.forEach(file_id => {
-        const file = db.read(['state', file_id])
-        result.dataset[node_id][file.name] = { raw: file.raw}
-      })
-    })
-    
-    download(result, `${result.name}-${result.type}`)
-  }
-  function import_db (data) {
-    register(data)
-    status.callback({ type: 'import', data })
-  }
-  function export_root ({name}) {
-    const result = db.read_all([name])
-    console.log(name, result)
-    download(result, name)
-  }
-  function import_root (data, name) {
-    Object.entries(data).forEach(([key, value]) => {
-      db.add([name, key], value)
-    })
-    console.log('hello')
-    db.push(['root_datasets'], { name: name })
-    status.callback({ type: 'import', data })
-  }
-  function get_sub (type) {
-    const subs = xtype === 'module' ? local_status.sub_modules : local_status.sub_instances[node_id]
-    return subs.filter(sub => sub.type === type)
-  }
-  function get_dataset ({ root = 'state', type: dataset_type, name: dataset_name } = { root: 'state'}) {
-    const node = db.read([root, status.ROOT_ID])
-    if(dataset_type){
-      const dataset_list = []
-      node.drive.forEach(dataset_id => {
-        const dataset = db.read([root, dataset_id])
-        if(dataset.type === dataset_type)
-          dataset_list.push(dataset.name)
-      })
-      if(dataset_name){
-        return recurse(status.ROOT_ID, dataset_type)
-      }
-      return dataset_list
-    }
-    const datasets = []
-    node.inputs && node.inputs.forEach(dataset_id => {
-      datasets.push(db.read([root, dataset_id]).type)
-    })
-    return datasets
-  
-    function recurse (node_id, dataset_type){
-      const node_list = []
-      const entry = db.read(['state', node_id])
-      entry.drive && entry.drive.forEach(dataset_id => {
-        const dataset = db.read(['state', dataset_id])
-        if(dataset.type === dataset_type && dataset.name === dataset_name){
-          node_list.push(dataset_id)
-          return
-        }
-      })
-      entry.subs && entry.subs.forEach(sub_id => node_list.push(...recurse(sub_id, dataset_type)))
-      return node_list
-    }
-  }
-  function register ({ type: dataset_type, name: dataset_name, dataset}) {
-    Object.entries(dataset).forEach(([node_id, files]) => {
-      const new_dataset = { files: [] }
-      const node = db.read(['state', node_id])
-
-      Object.entries(files).forEach(([file_id, file]) => {
-        const type = file_id.split('.').at(-1)
-        
-        file.id = db.gen_id(node.name + '.' + type)
-        file.name = file_id
-        file.type = type
-        file[file.type === 'js' ? 'subs' : 'hubs'] = [node_id]
-        
-        
-        db.add(['state', file.id], file)
-        new_dataset.files.push(file.id)
-      })
-  
-      new_dataset.id = db.gen_id(node_id + '.' + dataset_name + '.' + dataset_type + '.dataset')
-      new_dataset.name = dataset_name
-      new_dataset.type = dataset_type
-      //@TODO: Make dataset xtypes dynamic
-      new_dataset.xtype = dataset_type
-      new_dataset.node_id = node_id
-      
-      node.drive.push(new_dataset.id) //@TODO: Rethink how to simplify this push
-      db.add(['state', node.id], node)
-      db.add(['state', new_dataset.id], new_dataset)
-    })
-    console.log(' registered ' + dataset_name + '.' + dataset_type)
-  }
-  function unregister ({ type: dataset_type, name: dataset_name } = {}) {
-    return recurse(status.ROOT_ID)
-
-    function recurse (node_id){
-      const node = db.read(['state', node_id])
-      node.drive && node.drive.some(dataset_id => {
-        const dataset = db.read(['state', dataset_id])
-        if(dataset.name === dataset_name && dataset.type === dataset_type){
-          node.drive.splice(node.drive.indexOf(dataset_id), 1)
-          return true
-        }
-      })
-      node.inputs && node.inputs.some(dataset_id => {
-        const dataset = db.read(['state', dataset_id])
-        if(dataset.name === dataset_name && dataset.type === dataset_type){
-          node.inputs.splice(node.inputs.indexOf(dataset_id), 1)
-          swtch(dataset_type)
-          return true
-        }
-      })
-      db.add(['state', node_id], node)
-      node.subs.forEach(sub_id => recurse(sub_id))
-    }
-  }
-  function swtch ({ type: dataset_type, name: dataset_name = 'default'}) {
-    recurse(dataset_type, dataset_name, status.ROOT_ID)
-
-    async function recurse (target_type, target_name, id) {
-      const node = db.read(['state', id])
-      
-      let target_dataset
-      node.drive && node.drive.forEach(dataset_id => {
-        const dataset = db.read(['state', dataset_id])
-        if(target_name === dataset.name && target_type === dataset.type){
-          target_dataset = dataset
-          return
-        }
-      })
-      if(target_dataset){
-        node.inputs.forEach((dataset_id, i) => {
-          const dataset = db.read(['state', dataset_id])
-          if(target_type === dataset.type){
-            node.inputs.splice(i, 1)
-            return
-          }
-        })
-        node.inputs.push(target_dataset.id)
-      }
-      db.add(['state', id], node)
-      const input_map = await make_input_map(node.inputs)
-      status.listeners[id] && status.listeners[id].forEach(async listener => {
-        await listener(input_map)
-      })
-      node.subs && node.subs.forEach(sub_id => {
-        const subdataset_id = target_dataset?.mapping?.[sub_id] 
-        recurse(target_type, db.read(['state', subdataset_id])?.name || target_name, sub_id)
-      })
-    }
-  }
-  function get_drive (sid){
-    const id = status.s2i[sid]
-    if(!id)
-      throw new Error(`No drive found for symbol "${sid}"`)
-    return {
-      list: (path) => list(path, id),
-      get: (path) => get(path, id),
-      has: (path) => has(path, id),
-      on
-    }
-    function on (listener) {
-      (status.listeners[id] = status.listeners[id] || []).push(listener)
-    }
-  }
-  //Node specific functions
-  function list (path, id = node_id) {
-    const node = db.read(['state', id])
-    if(!node.drive)
-      throw new Error(`Node "${id}" has no drive`)
-    const dataset_names = node.drive.map(dataset_id => {
-      return dataset_id.split('.').at(-2) + '/'
-    })
-    if (path) {
-      let index
-      dataset_names.some((dataset_name, i) => {
-        if (path.includes(dataset_name)) {
-          index = i
-          return true
-        }
-      })
-      if (index === undefined)
-        throw new Error(`Dataset "${path}" not found in node "${node.name}"`) 
-      const dataset = db.read(['state', node.drive[index]])
-      return dataset.files.map(fileId => {
-        const file = db.read(['state', fileId])
-        return file.name
-      })
-    }
-    return dataset_names
-  }
-  async function get (path, id = node_id) {
-    const [dataset_name, file_name] = path.split('/')
-    const node = db.read(['state', id])
-    let dataset
-    if(!node.drive)
-      throw new Error(`Node ${node.id} has no drive defined in its fallback` + FALLBACK_POST_ERROR)
-    node.inputs.some(dataset_id => {
-      if (dataset_name === dataset_id.split('.').at(-2)) {
-        dataset = db.read(['state', dataset_id])
-        return true
-      }
-    })
-    if (!dataset) 
-      throw new Error(`Dataset "${dataset_name}" not found in node "${node.name}"`)
-    
-    let target_file
-    for (const file_id of dataset.files) {
-      const file = db.read(['state', file_id])
-      if (file.name === file_name) {
-        target_file =  { id: file.id, name: file.name, type: file.type, raw: await get_input(file)}
-        break
-      }
-    }
-    if (!target_file){
-      throw new Error(`File "${path}" not found in node "${node.id}"`)
-    }
-    return target_file
-  }
-  async function put (path, buffer, id = node_id) {
-    const [dataset_name, filename] = path.split('/')
-    let dataset
-    const node = db.read(['state', id])
-    node.drive.some(dataset_id => {
-      if (dataset_name === dataset_id.split('.').at(-2)) {
-        dataset = db.read(['state', dataset_id])
-        return true
-      }
-    })
-    if (!dataset) 
-      throw new Error(`Dataset "${dataset_name}" not found in node "${node.name}"`)
-    const type = filename.split('.').pop()
-    const raw_id = node.name + '.' + type
-    const file = {
-      id: raw_id,
-      name: filename,
-      type,
-      raw: buffer
-    }
-    for (const file_id of dataset.files) {
-      const temp_file = db.read(['state', file_id])
-      if(temp_file.name === filename){
-        file.id = file_id
-        break
-      }
-    }
-    if(!dataset.files.includes(file.id)){
-      file.id = db.gen_id(file.id)
-      dataset.files.push(file.id)
-      db.add(['state', dataset.id], dataset)
-    }
-    db.add(['state', file.id], file)
-    const input_map = await make_input_map(node.inputs)
-    status.listeners[node.id].forEach(async listener => {
-      await listener(input_map)
-    })
-    status.callback && status.callback({ type: 'put', data: id })
-
-    return { id: file.id, name: filename, type, raw: buffer }
-  }
-  function has (path, id = node_id) {
-    const [dataset_name, filename] = path.split('/')
-    let dataset
-    const node = db.read(['state', id])
-    node.drive.some(dataset_id => {
-      if (dataset_name === dataset_id.split('.').at(-2)) {
-        dataset = db.read(['state', dataset_id])
-        return true
-      }
-    })
-    if (!dataset) 
-      throw new Error(`Dataset "${dataset_name}" not found in node "${node.name}"`)
-    return dataset.files.some(file_id => {
-      const file = db.read(['state', file_id])
-      return file && file.name === filename
-    })
-  }
-}
-async function make_input_map (inputs) {
-  const input_map = []   
-  if (inputs) {
-    await Promise.all(inputs.map(async input => {
-      let files = []
-      const dataset = db.read(['state', input])
-      await Promise.all(dataset.files.map(async file_id => {
-        const input_state = db.read(['state', file_id])
-        files.push(dataset.id.split('.').at(-2) + '/' + input_state.name)
-      }))
-      input_map.push({ type: dataset.xtype, paths: files })
-    }))
-  }
-  return input_map
-}
-
-
-module.exports = STATE
-},{"io":10,"localdb":12}],4:[function(require,module,exports){
+},{"DOCS":6,"STATE":1,"footer":30,"header":32,"net_helper":18,"theme_widget":28,"topnav":34}],30:[function(require,module,exports){
 (function (__filename){(function (){
-const graphic = require('graphic')
-const IO = require('io')
 const STATE = require('STATE')
-const name = 'footer'
 const statedb = STATE(__filename)
-// ----------------------------------------
-const { sdb, subs: [get] } = statedb(fallback_module, fallback_instance)
-function fallback_module () { 
-	return {}
-}
-function fallback_instance () { 
-	const data = require('./instance.json')
-	data.inputs['footer.css'] = {
-		$ref: new URL('src/node_modules/css/default/footer.css', location).href
-	}
-	return data 
-}
-/******************************************************************************
-  APP FOOTER COMPONENT
-******************************************************************************/
-// ----------------------------------------
-const shopts = { mode: 'closed' }
-// ----------------------------------------
+const { get } = statedb(defaults)
+const net = require('net_helper')
+const graphic = require('graphic')
+
 module.exports = footer
 
-async function footer (opts) {
-  // ----------------------------------------
-  // ID + JSON STATE
-  // ----------------------------------------
-  const { id, sdb } = await get(opts.sid) 
+async function footer (opts, invite) {
+  const { id, sdb } = await get(opts.sid)
+  const { drive } = sdb
   const on = {
-		css: inject,
-		scroll,
-		json: fill
-	}
-	
-  const send = await IO(id, name, on)
-  // ----------------------------------------
-  // OPTS
-  // ----------------------------------------
-  let island = await graphic('island', './src/node_modules/assets/svg/deco-island.svg')
-  // ----------------------------------------
-  // TEMPLATE
-  // ----------------------------------------
-  const el = document.createElement('div')
-  const shadow = el.attachShadow(shopts)
-  shadow.innerHTML = `
-      <footer class='footer'>
-      </footer>
-    <style></style>`
-  // ----------------------------------------
-  const style = shadow.querySelector('style')
-  const footer = shadow.querySelector('footer')
+    style: inject,
+    content: fill
+  }
+  const { io } = net(id)
+  io.on = { app: io_app() }
+  if (invite) io.accept(invite)
 
-	sdb.watch(onbatch)
+  const island = await graphic('island', './src/node_modules/assets/svg/deco-island.svg')
+  const el = document.createElement('div')
+  const shadow = el.attachShadow({ mode: 'closed' })
+  shadow.innerHTML = `
+  <footer class="footer"></footer>
+  <style></style>`
+  const style = shadow.querySelector('style')
+  const body = shadow.querySelector('footer')
+
+  await sdb.watch(onbatch)
+
   return el
 
-  function onbatch(batch){
-		for (const {type, data} of batch) {
-      on[type](data)
-    }  
-	}
-	async function inject (data){
-		style.innerHTML = data.join('\n')
-	}
-  async function fill ([ opts ]) {
-    const graphics = opts.icons.map(icon => graphic('icon', icon.imgURL))
-    const icons = await Promise.all(graphics)
-    footer.innerHTML = `
-          <div class='scene'>
-              ${island.outerHTML}
-              <nav class='contacts'>
-                  ${opts.icons.map((icon, i) => 
-                      `<a href=${icon.url} 
-                      title=${icon.name} 
-                      target="${icon.url.includes('http') ? "_blank" : null}"
-                      >${icons[i].outerHTML}</a>`
-                  )}
-              </nav>
-          </div>
-          <p class='copyright'>${new Date().getFullYear()+' '+opts.copyright}</p>
-      `
+  async function onbatch (batch) {
+    for (const { type, paths } of batch) {
+      const data = await Promise.all(paths.map(path => drive.get(path).then(file => file.raw)))
+      const func = on[type] || fail
+      func(data, type)
+    }
   }
-  async function scroll () {
-    el.scrollIntoView({behavior: 'smooth'})
-    el.tabIndex = '0'
-    el.focus()
-    el.onblur = () => {
-      el.tabIndex = '-1'
-      el.onblur = null
+  function fail (data, type) { console.warn('footer: invalid batch', { cause: { data, type } }) }
+  function inject (data) { style.textContent = data.join('\n') }
+  async function fill ([content]) {
+    const data = typeof content === 'string' ? JSON.parse(content) : content
+    const icons = await Promise.all(data.icons.map(icon => graphic('icon', icon.imgURL)))
+    const scene = document.createElement('div')
+    const contacts = document.createElement('nav')
+    const copyright = document.createElement('p')
+    scene.className = 'scene'
+    contacts.className = 'contacts'
+    copyright.className = 'copyright'
+    contacts.append(...data.icons.map(make_contact))
+    scene.append(island, contacts)
+    copyright.textContent = `${new Date().getFullYear()} ${data.copyright}`
+    body.replaceChildren(scene, copyright)
+
+    function make_contact (icon, i) {
+      const a = document.createElement('a')
+      a.href = icon.url
+      a.title = icon.name
+      if (icon.url.includes('http')) a.target = '_blank'
+      a.append(icons[i])
+      return a
+    }
+  }
+  function io_app () {
+    return function onmessage_from_app (msg) {
+      const handlers = { scroll }
+      const handler = handlers[msg.type] || fail_message
+      handler(msg)
+    }
+  }
+  function scroll () { el.scrollIntoView({ behavior: 'smooth' }) }
+  function fail_message (msg) { console.warn('footer: unknown message', msg) }
+}
+
+function defaults () {
+  return {
+    api,
+    _: {
+      net_helper: { $: '' },
+      graphic: { $: '' }
+    },
+    drive: {}
+  }
+  function api () {
+    return {
+      _: {
+        net_helper: { 0: '' },
+        graphic: { 0: '' }
+      },
+      drive: {
+        'style/': {
+          'footer.css': { $ref: '../css/default/footer.css' }
+        },
+        'content/': {
+          'footer.json': { $ref: 'footer.json' }
+        }
+      }
     }
   }
 }
 
 }).call(this)}).call(this,"/src/node_modules/footer/footer.js")
-},{"./instance.json":5,"STATE":3,"graphic":8,"io":10}],5:[function(require,module,exports){
-module.exports={
-  "inputs": {
-    "footer.json": {
-      "data": {
-        "copyright": " PlayProject",
-        "icons": [
-          {
-            "id": "1",
-            "name": "email",
-            "imgURL": "./src/node_modules/assets/svg/email.svg",
-            "url": "mailto:ninabreznik@gmail.com"
-          },
-          {
-            "id": "2",
-            "name": "twitter",
-            "imgURL": "./src/node_modules/assets/svg/twitter.svg",
-            "url": "https://twitter.com/playproject_io"
-          },
-          {
-            "id": "3",
-            "name": "Github",
-            "imgURL": "./src/node_modules/assets/svg/github.svg",
-            "url": "https://github.com/playproject-io"
-          },
-          {
-            "id": "4",
-            "name": "Gitter",
-            "imgURL": "./src/node_modules/assets/svg/gitter.svg",
-            "url": "https://gitter.im/playproject-io/community"
-          }
-        ]
-      }
-    }
-  }
-}
-},{}],6:[function(require,module,exports){
-(function (__filename){(function (){
-/******************************************************************************
-  STATE
-******************************************************************************/
-const STATE = require('STATE')
-const localdb = require('localdb')
-const name = 'graph_explorer'
-const statedb = STATE(__filename)
-const default_slots = [['hubs', 'subs'], ['inputs', 'outputs']]
-// ----------------------------------------
-const { sdb, subs: [get] } = statedb(fallback_module, fallback_instance)
-function fallback_module () { 
-  return {}
-}
-function fallback_instance () {
-  return {
-    inputs: {
-      'graph_explorer.css': {
-        $ref: new URL('src/node_modules/css/default/graph_explorer.css', location).href
-      }
-    }
-  }
-}
-
-const IO = require('io')
-const {copy, get_color, download_json} = require('helper')
-/******************************************************************************
-  GRAPH COMPONENT
-******************************************************************************/
-// ----------------------------------------
-const shopts = { mode: 'closed' }
-// ----------------------------------------
-
-module.exports = graph_explorer
-
-async function graph_explorer (opts) {
-  // ----------------------------------------
-  // ID + JSON STATE
-  // ----------------------------------------
-  const db = localdb()
-  const { id, sdb } = await get(opts.sid)
-  const hub_id = opts.hub[0]
-  const status = { tab_id: 0, count: 0, entry_types: {}, menu_ids: [] }
-  const on = {
-    init,
-    css: inject,
-    scroll
-  }
-
-  const on_add = {
-    entry: add_entry,
-    entry_compact: add_entry_compact,
-    menu: add_action
-  }
-  const admin = sdb.req_access(opts.sid)
-  const send = await IO(id, name, on)
-  // ----------------------------------------
-  // TEMPLATE
-  // ----------------------------------------
-  const el = document.createElement('div')
-  const shadow = el.attachShadow(shopts)
-  const style = document.createElement('style')
-  await sdb.watch(onbatch)
-  shadow.innerHTML = `
-  <div>
-    <button class="export">
-      Export
-    </button>
-    <button class="import">
-      Import
-    </button>
-    <input style="display: none;" class="upload" type='file' />
-  </div>
-  <span>Compact mode</span>
-  <label class="toggle_switch">
-    <input type="checkbox">
-    <span class="slider"></span>
-  </label>
-  <main>
-
-  </main>`
-  const main = shadow.querySelector('main')
-  const compact_switch = shadow.querySelector('.toggle_switch > input')
-  const upload = shadow.querySelector('.upload')
-  const import_btn = shadow.querySelector('.import')
-  const export_btn = shadow.querySelector('.export')
-  shadow.append(style)
-  shadow.addEventListener('copy', oncopy)
-  /************************************
-   Listeners
-  *************************************/
-  compact_switch.onchange = e => add_root(e.target.checked)
-  export_btn.onclick = export_fn
-  import_btn.onclick = () => upload.click()
-  upload.onchange = import_fn
-  return el
-
-  /******************************************
-   Mix
-  ******************************************/
-  function onbatch (batch) {
-    for (const {type, data} of batch) {
-      on[type](data)
-    }  
-  }
-  async function oncopy (e) {
-    const selection = shadow.getSelection()
-    e.clipboardData.setData('text/plain', copy(selection))
-    e.preventDefault()
-  }
-  function export_fn () {
-    const blob = new Blob([JSON.stringify(localStorage, null, 2)], { type: "application/json" })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement("a")
-    a.href = url
-    a.download = 'snapshot.json'
-    document.body.appendChild(a)
-    a.click()
-    document.body.removeChild(a)
-    URL.revokeObjectURL(url)
-  }
-  function import_fn () {
-    const file = upload.files[0]
-    const reader = new FileReader()
-    reader.onload = e => {
-      const blob = JSON.parse(e.target.result)
-      admin.load(blob)
-    }
-    reader.readAsText(file)
-  }
-  async function init ({ data }) {
-    let id = Object.keys(data).length + 1
-
-    add({ id, name: 'edit', type: 'action', hubs: [] })
-    add({ id, name: 'link', type: 'action', hubs: [] })
-    add({ id, name: 'unlink', type: 'action', hubs: [] })
-    add({ id, name: 'drop', type: 'action', hubs: [] })
-
-    status.graph = data
-    add_root(false)
-
-    function add (args){
-      status.menu_ids.push(args.id)
-      data[id++] = args
-    }
-  }
-  async function add_root(compact) {
-    status.xentry = null
-    status.entry_types = {}
-    status.count = 0
-    status.tab_id = 0
-    main.innerHTML = ''
-    const root_entries = Object.values(status.graph).filter(entry => !entry.hubs)
-    if(compact)
-      root_entries.forEach((data, i) => add_entry_compact({hub_el: main, data, last: i === root_entries.length - 1, ancestry:[] }))
-    else  
-      root_entries.forEach((data, i) => add_entry({hub_el: main, data, last: i === root_entries.length - 1, ancestry:[] }))
-  }
-  function html_template (data, space, pos){
-    const element = document.createElement('div')
-    element.classList.add(data.type, 'entry', 'a'+data.id)
-    element.tabIndex = '0'
-    element.dataset.space = space
-    element.dataset.pos = pos
-    return element
-  }
-  /******************************************
-   Addition Operation
-  ******************************************/
-  // function add_el ({ data, parent, space, grand_last, type }){
-  //   const is_single = parent.children.length ? false : true
-  //   if(data.root){
-  //     parent.prepend(add_root({ data, last: false}))
-  //     return
-  //   }
-  //   //hub or sub node check
-  //   if(type === 'inputs')
-  //     parent.append(on_add[type]({ data, space, grand_last, first: is_single}))
-  //   else
-  //     parent.prepend(on_add[type]({ data, space, grand_last, last: is_single}))
-  // }
-
-  function add_action ({ hub_el, data, last, space = '' }) {
-    const element = html_template(data, last, space)
-    hub_el.append(element)
-    !status.entry_types[data.type] && (status.entry_types[data.type] = Object.keys(status.entry_types).length)
-
-    element.innerHTML = `
-    <div class="slot_list">
-      <span class="odd">${space}</span>
-      <span class="type_emo odd"></span>
-      <span class="name odd">${data.name}</span>
-    </div>`
-    const name = element.querySelector('.slot_list > .name')
-    name.onclick = () => send({ type: 'click', to: hub_id, data })
-
-  }
-  function add_entry_compact ({ hub_el, data, first, last, space = '', pos, ancestry }) {
-    //Init
-    const element = html_template(data, last, space, pos)
-    !status.entry_types[data.type] && (status.entry_types[data.type] = Object.keys(status.entry_types).length)
-    ancestry = [...ancestry]
-    let lo_space = space + (last ? '&nbsp;' : '│')
-    let hi_space = space + (first ? '&nbsp;' : '│')
-    const space_handle = [], els = []
-    let slot_no = 0, slot_on
-
-    //HTML
-    element.innerHTML = `
-      <div class="slot_list">
-        <span class="space odd"><!--
-        -->${space}<span>${last ? '└' : first ? "┌" : '├'}</span><!--
-        --><span class='on'>${last ? '┗' : first ? "┏" : '┠'}</span>
-        </span><!--
-        --><span class="menu_emo"></span><!--
-        --><span class="type_emo odd"></span><!--
-        --><span class="name odd">${data.name}</span>
-      </div>
-      <div class="menu entries"></div>
-    `
-
-    //Unavoidable mix
-    const slot_list = element.querySelector('.slot_list')
-    const name = element.querySelector('.slot_list > .name')
-    hub_el.append(element)
-    const copies = main.querySelectorAll('.a'+data.id + '> .slot_list')
-    if(copies.length > 1){
-      copies.forEach(copy => !copy.previousElementSibling && (copy.style.color = '#000000'))
-    }
-    if(ancestry.includes(data.id)){
-      name.onclick = () => {
-        const copies = main.querySelectorAll('.a'+data.id + '> .slot_list')
-        copies.forEach((copy, i) => {
-          if(copy === slot_list)
-            return
-          const temp1 = copy.style.color
-          const temp2 = copy.style.backgroundColor
-          copy.style.color = '#fff'
-          copy.style.backgroundColor = '#000000'
-          setTimeout(() => {
-            copy.style.color = temp1
-            copy.style.backgroundColor = temp2
-          }, 1000)
-        })
-      }
-      return
-    }
-    ancestry.push(data.id)
-
-    //Elements
-    const menu_emo = element.querySelector('.slot_list > .menu_emo')
-    const type_emo = element.querySelector('.slot_list > .type_emo')
-    const menu = element.querySelector('.menu')
-
-    //Listeners
-    type_emo.onclick = type_click
-    name.onclick = () => send({ type: 'click', to: hub_id, data })
-    const slotmap = []
-    const data_keys = Object.keys(data)
-    const new_pair = [[], []]
-    const slot_handle = []
-    let check = false
-    default_slots.forEach(pair => {
-      pair.forEach((slot, i) => {
-        if(data_keys.includes(slot)){
-          new_pair[i].push(slot)
-          check = true
-        }
-      })
-    })
-    check && slotmap.push(new_pair)
-    slotmap.forEach(handle_slot)
-    menu_click({el: menu, emo: menu_emo, data: status.menu_ids, pos: 0, type: 'menu'})
-    if(getComputedStyle(type_emo, '::before').content === 'none')
-      type_emo.innerHTML = `[${status.entry_types[data.type]}]`
-
-    //Procedures
-    async function handle_slot (pair, i) {
-      const slot_check = [false, false]
-      const slot_emo = document.createElement('span')
-      slot_emo.innerHTML = '<span>─</span><span></span>'
-      menu_emo.before(slot_emo)
-      slot_no++
-
-      pair.forEach((x, j) => {
-        let gap, mode, emo_on
-        const pos = !j
-        const count = status.count++
-        const style = document.createElement('style')
-        const entries = document.createElement('div')
-        entries.classList.add('entries')
-
-        element.append(style)
-        if(pos){
-          slot_list.before(entries)
-          mode= 'hi'
-          gap = hi_space
-          hi_space += `<span class="space${count}"><span class="hi">&nbsp;</span>${x.length ? '<span class="xhi">│</span>' : ''}&nbsp;&nbsp;</span>`
-        }
-        else{
-          menu.after(entries)
-          mode = 'lo'
-          gap = lo_space
-          lo_space += `<span class="space${count}"><span class="lo">&nbsp;</span>${x.length ? '<span class="xlo">│</span>' : ''}&nbsp;&nbsp;</span>`
-        }
-        style.innerHTML = `.space${count} > .x${mode}{display: none;}`
-        els.push(slot_emo)
-        space_handle.push(() => style.innerHTML = `.space${count}${slot_on ? ` > .x${mode}` : ''}{display: none;}`)
-        if(!x.length){
-          const space = document.createElement('span')
-          space.innerHTML = '&nbsp;&nbsp;&nbsp;'
-          return
-        }
-        slot_emo.classList.add('compact')
-
-        slot_handle.push(() => {
-          slot_emo.classList.add('on')
-          style.innerHTML = `.space${count} > .${emo_on ? 'x' : ''}${mode}{display: none;}`
-          // emo_on && space_handle[i]()
-          slot_check[j] = emo_on = !emo_on
-          if(slot_check[0] && slot_check[1])
-            slot_emo.children[0].innerHTML = '┼'
-          else if(slot_check[0] && !slot_check[1])
-            slot_emo.children[0].innerHTML = '┴'
-          else if(!slot_check[0] && slot_check[1])
-            slot_emo.children[0].innerHTML = '┬'
-          else{
-            slot_emo.children[0].innerHTML = '─'
-            slot_emo.classList.remove('on')
-          }
-          const ids = []
-          x.forEach(slot => ids.push(...data[slot]))
-          handle_click({space: gap, pos, el: entries, data: ids, ancestry, type: 'entry_compact' })
-        })
-      })
-      if(getComputedStyle(slot_emo, '::before').content === 'none')
-        slot_emo.innerHTML = `<span>─</span><span>${slot_no}─</span>`
-    }
-    async function type_click() {
-      slot_on = !slot_on
-      // if(status.xentry === type_emo)
-      //   status.xentry = null
-      // else{
-      //   status.xentry?.click()
-      //   status.xentry = type_emo
-      // }
-      slot_list.classList.toggle('on')
-      let temp = element
-      //Find path to root
-      while(temp.tagName !== 'MAIN'){
-        if(temp.classList.contains('entry')){
-          slot_on ? temp.classList.add('on') : temp.classList.remove('on')
-          while(temp.previousElementSibling){
-            temp = temp.previousElementSibling
-            slot_on ? temp.classList.add('on') : temp.classList.remove('on')
-          }
-        }
-        temp = temp.parentElement
-      }
-      els.forEach((emo, i) => {
-        if(!emo.classList.contains('on')){
-          space_handle[i]()
-        }
-      })
-      slot_handle[0] && slot_handle[0]()
-      slot_handle[1] && slot_handle[1]()
-    }
-    async function menu_click({ emo, emo_on, ...rest }, i) {
-      emo.onclick = () => {
-        emo.classList.toggle('on')
-        emo_on = !emo_on
-        handle_click({space: lo_space, ...rest })
-      }
-    }
-  }
-  function add_entry ({ hub_el, data, first, last, space = '', pos, ancestry }) {
-    //Init
-    const element = html_template(data, last, space, pos)
-    !status.entry_types[data.type] && (status.entry_types[data.type] = Object.keys(status.entry_types).length)
-    ancestry = [...ancestry]
-    let lo_space = space + (last ? '&nbsp;&nbsp;&nbsp;' : '│&nbsp;&nbsp;')
-    let hi_space = space + (first ? '&nbsp;&nbsp;&nbsp;' : '│&nbsp;&nbsp;')
-    const space_handle = [], els = []
-    let slot_no = 0, slot_on
-
-    //HTML
-    element.innerHTML = `
-      <div class="slot_list">
-        <span class="space odd"><!--
-        -->${space}<span>${last ? '└' : first ? "┌" : '├'}</span><!--
-        --><span class='on'>${last ? '┗' : first ? "┏" : '┠'}</span>
-        </span><!--
-        --><span class="menu_emo"></span><!--
-        --><span class="type_emo odd"></span><!--
-        --><span class="name odd">${data.name}</span>
-      </div>
-      <div class="menu entries"></div>
-    `
-
-    //Unavoidable mix
-    const slot_list = element.querySelector('.slot_list')
-    const name = element.querySelector('.slot_list > .name')
-    hub_el.append(element)
-    const copies = main.querySelectorAll('.a'+data.id + '> .slot_list')
-    if(copies.length > 1){
-      copies.forEach(copy => !copy.previousElementSibling && (copy.style.color = '#000000'))
-    }
-    if(ancestry.includes(data.id)){
-      name.onclick = () => {
-        const copies = main.querySelectorAll('.a'+data.id + '> .slot_list')
-        copies.forEach((copy, i) => {
-          if(copy === slot_list)
-            return
-          const temp1 = copy.style.color
-          const temp2 = copy.style.backgroundColor
-          copy.style.color = '#fff'
-          copy.style.backgroundColor = '#000000'
-          setTimeout(() => {
-            copy.style.color = temp1
-            copy.style.backgroundColor = temp2
-          }, 1000)
-        })
-      }
-      return
-    }
-    ancestry.push(data.id)
-
-    //Elements
-    const menu_emo = element.querySelector('.slot_list > .menu_emo')
-    const type_emo = element.querySelector('.slot_list > .type_emo')
-    const space_emo = element.querySelector('.slot_list > .space')
-    const menu = element.querySelector('.menu')
-
-    //Listeners
-    space_emo.onclick = () => type_click(0)
-    type_emo.onclick = () => type_click(1)
-    name.onclick = () => send({ type: 'click', to: hub_id, data })
-    const slotmap = []
-    const data_keys = Object.keys(data)
-    const new_pair = [[], []]
-    const slot_handle = []
-    let check = false
-    default_slots.forEach(pair => {
-      pair.forEach((slot, i) => {
-        if(data_keys.includes(slot)){
-          new_pair[i].push(slot)
-          check = true
-        }
-      })
-    })
-    check && slotmap.push(new_pair)
-    slotmap.forEach(handle_slot)
-    menu_click({el: menu, emo: menu_emo, data: status.menu_ids, pos: 0, type: 'menu'})
-    if(getComputedStyle(type_emo, '::before').content === 'none')
-      type_emo.innerHTML = `[${status.entry_types[data.type]}]`
-
-    //Procedures
-    async function handle_slot (pair, i) {
-      const slot_check = [false, false]
-      const slot_emo = document.createElement('span')
-      slot_emo.innerHTML = '<span></span><span>─</span>'
-      menu_emo.before(slot_emo)
-      slot_no++
-
-      pair.forEach((x, j) => {
-        let gap, mode, emo_on
-        const pos = !j
-        const count = status.count++
-        const style = document.createElement('style')
-        const entries = document.createElement('div')
-        entries.classList.add('entries')
-
-        element.append(style)
-        if(pos){
-          slot_list.before(entries)
-          mode= 'hi'
-          gap = hi_space
-          hi_space += `<span class="space${count}"><span class="hi">&nbsp;</span>${x.length ? '<span class="xhi">│</span>' : ''}&nbsp;&nbsp;</span>`
-        }
-        else{
-          menu.after(entries)
-          mode = 'lo'
-          gap = lo_space
-          lo_space += `<span class="space${count}"><span class="lo">&nbsp;</span>${x.length ? '<span class="xlo">│</span>' : ''}&nbsp;&nbsp;</span>`
-        }
-        style.innerHTML = `.space${count} > .x${mode}{display: none;}`
-        els.push(slot_emo)
-        space_handle.push(() => style.innerHTML = `.space${count}${slot_on ? ` > .x${mode}` : ''}{display: none;}`)
-        if(!x.length){
-          const space = document.createElement('span')
-          space.innerHTML = '&nbsp;&nbsp;&nbsp;'
-          return
-        }
-        slot_emo.classList.add('compact')
-
-        slot_handle.push(() => {
-          slot_emo.classList.add('on')
-          style.innerHTML = `.space${count} > .${emo_on ? 'x' : ''}${mode}{display: none;}`
-          // emo_on && space_handle[i]()
-          slot_check[j] = emo_on = !emo_on
-          if(slot_check[0] && slot_check[1])
-            slot_emo.children[1].innerHTML = '┼'
-          else if(slot_check[0] && !slot_check[1])
-            slot_emo.children[1].innerHTML = '┴'
-          else if(!slot_check[0] && slot_check[1])
-            slot_emo.children[1].innerHTML = '┬'
-          else{
-            slot_emo.children[1].innerHTML = '─'
-            slot_emo.classList.remove('on')
-          }
-          const ids = []
-          x.forEach(slot => ids.push(...data[slot]))
-          handle_click({space: gap, pos, el: entries, data: ids, ancestry })
-        })
-      })
-      if(getComputedStyle(slot_emo, '::before').content === 'none')
-        slot_emo.innerHTML = `<span>${slot_no}─</span><span>─</span>`
-    }
-    async function type_click(i) {
-      slot_on = !slot_on
-      // if(status.xentry === type_emo)
-      //   status.xentry = null
-      // else{
-      //   status.xentry?.click()
-      //   status.xentry = type_emo
-      // }
-      slot_list.classList.toggle('on')
-      let temp = element
-      //Find path to root
-      while(temp.tagName !== 'MAIN'){
-        if(temp.classList.contains('entry')){
-          slot_on ? temp.classList.add('on') : temp.classList.remove('on')
-          while(temp.previousElementSibling){
-            temp = temp.previousElementSibling
-            slot_on ? temp.classList.add('on') : temp.classList.remove('on')
-          }
-        }
-        temp = temp.parentElement
-      }
-      els.forEach((emo, i) => {
-        if(!emo.classList.contains('on')){
-          space_handle[i]()
-        }
-      })
-      // slot_handle[0] && slot_handle[0]()
-      slot_handle[i] && slot_handle[i]()
-    }
-
-    async function menu_click({ emo, emo_on, ...rest }, i) {
-      emo.onclick = () => {
-        emo.classList.toggle('on')
-        emo_on = !emo_on
-        handle_click({space: lo_space, ...rest })
-      }
-    }
-  }
-  // async function add_node_data (name, type, parent_id, users, author){
-  //   const node_id = status.graph.length
-  //   status.graph.push({ id: node_id, name, type: state.code_words[type], room: {}, users })
-  //   if(parent_id){
-  //     save_msg({
-  //         head: [id],
-  //         type: 'save_msg',
-  //         data: {username: 'system', content: author + ' added ' + type.slice(0,-1)+': '+name, chat_id: parent_id}
-  //       })
-  //     //Add a message in the chat
-  //     if(state.chat_task && parent_id === state.chat_task.id.slice(1))
-  //       channel_up.send({
-  //         head: [id, channel_up.send.id, channel_up.mid++],
-  //         type: 'render_msg',
-  //         data: {username: 'system', content: author+' added '+type.slice(0,-1)+': '+name}
-  //       })
-  //     const sub_nodes = graph[parent_id][state.add_words[type]]
-  //     sub_nodes ? sub_nodes.push(node_id) : graph[parent_id][state.add_words[type]] = [node_id]
-  //   }
-  //   else{
-  //     graph[node_id].root = true
-  //     graph[node_id].users = [opts.host]
-  //   }
-  //   save_msg({
-  //     head: [id],
-  //     type: 'save_msg',
-  //     data: {username: 'system', content: author + ' created ' + type.slice(0,-1)+': '+name, chat_id: node_id}
-  //   })
-  //   const channel = state.net[state.aka.taskdb]
-  //   channel.send({
-  //     head: [id, channel.send.id, channel.mid++],
-  //     type: 'set',
-  //     data: graph
-  //   })
-    
-  // }
-  // async function on_add_node (data) {
-  //   const node = data.id ? shadow.querySelector('#a' + data.id + ' > .'+data.type) : main
-  //   node && node.children.length && add_el({ data: { name: data.name, id: status.graph.length, type: state.code_words[data.type] }, parent: node, grand_last: data.grand_last, type: data.type, space: data.space })
-  //   add_node_data(data.name, data.type, data.id, data.users, data.user)
-  // }
-  /******************************************
-   Event handlers
-  ******************************************/
-  function handle_focus (e) {
-    state.xtask = e.target
-    state.xtask.classList.add('focus')
-    state.xtask.addEventListener('blur', e => {
-      if(e.relatedTarget && e.relatedTarget.classList.contains('noblur'))
-        return
-      state.xtask.classList.remove('focus')
-      state.xtask = undefined
-    }, { once: true })
-  }
-  function handle_popup (e) {
-    const el = e.target
-    el.classList.add('show')
-    popup.style.top = el.offsetTop - 20 + 'px'
-    popup.style.left = el.offsetLeft - 56 + 'px'
-    popup.focus()
-    popup.addEventListener('blur', () => {
-      el.classList.remove('show')
-    }, { once: true })
-  }
-  function handle_click ({ el, data, pos, hub_id, type = 'entry', ...rest }) {
-    el.classList.toggle('show')
-    if(data && el.children.length < 1){
-      length = data.length - 1
-      data.forEach((value, i) => on_add[type]({ hub_el: el, data: {...status.graph[value], hub_id}, first: pos ? 0 === i : false, last: pos ? false : length === i, pos, ...rest }))
-    }
-  }
-  async function handle_export () {
-    const data = await traverse( state.xtask.id.slice(1) )
-    download_json(data)
-  }
-  async function handle_add (data) {
-    data = data.slice(2).trim().toLowerCase() + 's'
-    const input = document.createElement('input')
-    let node, task_id, space = '', grand_last = true, root = true
-    //expand other siblings
-    if(state.xtask){
-      node = state.xtask.querySelector('.' + data)
-      task_id = state.xtask.id.slice(1)
-      const before = state.xtask.querySelector('.' + data.slice(0,3))
-      before.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable: true, view: window}))
-      node.classList.add('show')
-      grand_last = state.xtask.dataset.grand_last
-      space = state.xtask.dataset.space
-      state.xtask.classList.remove('focus')
-      state.xtask = undefined
-      root = false
-    }
-    else{
-      node = main
-      task_id = ''
-    }
-    node.prepend(input)
-    input.onkeydown = async (event) => {
-      if (event.key === 'Enter') {
-        input.blur()
-        add_el({ data : { name: input.value, id: status.graph.length, type: state.code_words[data], root }, space, grand_last, type: data, parent: node })
-        const users = task_id ? graph[task_id].users : [host]
-        add_node_data(input.value, data, task_id, users, host)
-        //sync with other users
-        if(users.length > 1)
-          channel_up.send({
-            head: [id, channel_up.send.id, channel_up.mid++],
-            type: 'send',
-            data: {to: 'task_explorer', route: ['up', 'task_explorer'], users: graph[task_id].users.filter(user => user !== host), type: 'on_add_node', data: {name: input.value, id: task_id, type: data, users, grand_last, space, user: host} }
-          })
-      }
-    }
-    input.focus()
-    input.onblur = () => input.remove()
-  }
-  /******************************************
-   Tree traversal
-  ******************************************/
-  async function jump (e){
-    let target_id = e.currentTarget.dataset.id
-    const el = main.querySelector('#a'+target_id)
-    if(el)
-      el.focus()
-    else{
-      const path = []
-      let temp
-      for(temp = status.graph[target_id]; temp.hub; temp = status.graph[temp.hub[0]])
-        path.push(temp.id)
-      temp = main.querySelector('#a'+temp.id)
-      target_id = 'a'+target_id
-      while(temp.id !== target_id){
-        const sub_emo = temp.querySelector('.sub_emo')
-        sub_emo.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable: true, view: window}))
-        temp.classList.add('show')
-        temp = temp.querySelector('#a'+path.pop())
-      }
-      temp.focus()
-    }
-      
-  }
-  async function traverse (id) {
-    state.result = []
-    state.track = []
-    recurse(id)
-    return state.result
-  }
-  function recurse (id){
-    if(state.track.includes(id))
-      return
-    state.result.push(graph[id])
-    state.track.push(id)
-    for(temp = 0; graph[id].sub && temp < graph[id].sub.length; temp++)
-      recurse(graph[id].sub[temp])
-    for(temp = 0; graph[id].inputs && temp < graph[id].inputs.length; temp++)
-      recurse(graph[id].inputs[temp])
-    for(temp = 0; graph[id].outputs && temp < graph[id].outputs.length; temp++)
-      recurse(graph[id].outputs[temp])
-  }
-  /******************************************
-   Communication
-  ******************************************/
-  async function scroll () {
-    el.scrollIntoView({behavior: 'smooth'})
-    el.tabIndex = '0'
-    el.focus()
-    el.onblur = () => {
-      el.tabIndex = '-1'
-      el.onblur = null
-    }
-  }
-  async function inject (data){
-    style.innerHTML = data.join('\n')
-  }
-}
-}).call(this)}).call(this,"/src/node_modules/graph_explorer/graph_explorer.js")
-},{"STATE":3,"helper":7,"io":10,"localdb":12}],7:[function(require,module,exports){
-function copy (selection) {
-  const range = selection.getRangeAt(0)
-  const selectedElements = []
-  const walker = document.createTreeWalker(
-    range.commonAncestorContainer,
-    NodeFilter.SHOW_ELEMENT,
-    {
-        acceptNode: function(node) {
-            return range.intersectsNode(node) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT
-        }
-    },
-    false
-  )
-
-  while (walker.nextNode()) {
-      walker.currentNode.tagName === 'SPAN' && selectedElements.push(walker.currentNode)
-  }
-  let text = ''
-  selectedElements.forEach(el => {
-    const before = getComputedStyle(el, '::before').content
-    text += (before === 'none' ? '' : before.slice(1, -1)) + el.textContent
-    text += el.classList.contains('name') ? '\n' : ''
-  })
-  return text
-}
-function get_color () {
-  const letters = 'CDEF89'
-  let color = '#'
-  for (let i = 0; i < 6; i++) {
-      color += letters[Math.floor(Math.random() * letters.length)]
-  }
-  return color;
-}
-function download_json (data) {
-  const json_string = JSON.stringify(data, null, 2);
-  const blob = new Blob([json_string], { type: 'application/json' });
-  const link = document.createElement('a');
-  link.href = URL.createObjectURL(blob);
-  link.download = 'data.json';
-  link.click();
-}
-module.exports = {copy, get_color, download_json}
-},{}],8:[function(require,module,exports){
+},{"STATE":1,"graphic":31,"net_helper":18}],31:[function(require,module,exports){
 const loadSVG = require('loadSVG')
 
 function graphic(className, url) {
@@ -2827,175 +11211,116 @@ function graphic(className, url) {
 }   
 
 module.exports = graphic
-},{"loadSVG":11}],9:[function(require,module,exports){
+},{"loadSVG":33}],32:[function(require,module,exports){
 (function (__filename){(function (){
+const STATE = require('STATE')
+const statedb = STATE(__filename)
+const { get } = statedb(defaults)
+const net = require('net_helper')
 const graphic = require('graphic')
 const Rellax = require('rellax')
-const IO = require('io')
-const STATE = require('STATE')
-const name = 'header'
-const statedb = STATE(__filename)
-const shopts = { mode: 'closed' }
-/******************************************************************************
-  HEADER COMPONENT
-******************************************************************************/
 
-// ----------------------------------------
-const { sdb, subs: [get] } = statedb(fallback_module, fallback_instance)
-function fallback_module () { 
-  return {}
+module.exports = header
+
+async function header (opts, invite) {
+  const { id, sdb } = await get(opts.sid)
+  const { drive } = sdb
+  const on = {
+    style: inject,
+    content: fill
+  }
+  const { io } = net(id)
+  io.on = { app: io_app() }
+  if (invite) io.accept(invite)
+
+  const svg = './src/node_modules/assets/svg/'
+  const [island, sun, ...clouds] = await Promise.all([
+    graphic('playIsland', svg + 'play-island.svg'),
+    graphic('sun', svg + 'sun.svg'),
+    ...[1, 2, 3, 4, 5, 6, 7].map(n => graphic('cloud' + n, svg + 'cloud.svg'))
+  ])
+  // parallax speed per graphic, same as before the move
+  const speeds = [4, 2, 4, 2, 4, 3, 3]
+  new Rellax(sun, { speed: 2 }) // eslint-disable-line no-new
+  clouds.forEach((cloud, i) => new Rellax(cloud, { speed: speeds[i] }))
+
+  const el = document.createElement('div')
+  const shadow = el.attachShadow({ mode: 'closed' })
+  shadow.innerHTML = `
+  <div class="header">
+    <h1 class="title"></h1>
+    <section class="scene">
+      <div class="sunCloud"></div>
+    </section>
+  </div>
+  <style></style>`
+  const style = shadow.querySelector('style')
+  const scene = shadow.querySelector('.scene')
+  const sun_cloud = shadow.querySelector('.sunCloud')
+  const title = shadow.querySelector('.title')
+  const [cloud1, cloud2, ...rest] = clouds
+  scene.append(...rest, island)
+  sun_cloud.append(cloud1, sun, cloud2)
+
+  await sdb.watch(onbatch)
+
+  return el
+
+  async function onbatch (batch) {
+    for (const { type, paths } of batch) {
+      const data = await Promise.all(paths.map(path => drive.get(path).then(file => file.raw)))
+      const func = on[type] || fail
+      func(data, type)
+    }
+  }
+  function fail (data, type) { console.warn('header: invalid batch', { cause: { data, type } }) }
+  function inject (data) { style.textContent = data.join('\n') }
+  function fill ([content]) {
+    const data = typeof content === 'string' ? JSON.parse(content) : content
+    title.textContent = data.title
+  }
+  function io_app () {
+    return function onmessage_from_app (msg) {
+      const handlers = { scroll }
+      const handler = handlers[msg.type] || fail_message
+      handler(msg)
+    }
+  }
+  function scroll () { el.scrollIntoView({ behavior: 'smooth' }) }
+  function fail_message (msg) { console.warn('header: unknown message', msg) }
 }
-function fallback_instance () {
+
+function defaults () {
   return {
-    inputs: {
-      'header.css': {
-        $ref: new URL('src/node_modules/css/default/header.css', location).href
+    api,
+    _: {
+      net_helper: { $: '' },
+      graphic: { $: '' },
+      rellax: { $: '' }
+    },
+    drive: {}
+  }
+  function api () {
+    return {
+      _: {
+        net_helper: { 0: '' },
+        graphic: { 0: '' },
+        rellax: { 0: '' }
       },
-      "header.json": {
-        data: {
-          "title": "Infrastructure for the next-generation Internet"
+      drive: {
+        'style/': {
+          'header.css': { $ref: '../css/default/header.css' }
+        },
+        'content/': {
+          'header.json': { $ref: 'header.json' }
         }
       }
     }
   }
 }
-module.exports = header
-
-async function header (opts) {
-  // ----------------------------------------
-  // ID + JSON STATE
-  // ----------------------------------------
-  const { id, sdb } = await get(opts.sid)
-  const on = {
-    css: inject,
-    json: fill,
-    scroll
-  }
-  const send = await IO(id, name, on)
-  // ----------------------------------------
-  // OPTS
-  // ----------------------------------------
-  var graphics = [
-    graphic('playIsland', './src/node_modules/assets/svg/play-island.svg'),
-    graphic('sun', './src/node_modules/assets/svg/sun.svg'),
-    graphic('cloud1', './src/node_modules/assets/svg/cloud.svg'),
-    graphic('cloud2', './src/node_modules/assets/svg/cloud.svg'),
-    graphic('cloud3', './src/node_modules/assets/svg/cloud.svg'),
-    graphic('cloud4', './src/node_modules/assets/svg/cloud.svg'),
-    graphic('cloud5', './src/node_modules/assets/svg/cloud.svg'),
-    graphic('cloud6', './src/node_modules/assets/svg/cloud.svg'),
-    graphic('cloud7', './src/node_modules/assets/svg/cloud.svg'),
-  ]
-
-  const [playIsland, sun, cloud1, cloud2, cloud3, cloud4, cloud5, cloud6, cloud7] = await Promise.all(graphics)
-
-  // Parallax effects
-  // let playRellax = new Rellax(playIsland, { speed: 2 })
-  let sunRellax = new Rellax(sun, { speed: 2 })
-  let cloud1Rellax = new Rellax(cloud1, { speed: 4 })
-  let cloud2Rellax = new Rellax(cloud2, { speed: 2 })
-  let cloud3Rellax = new Rellax(cloud3, { speed: 4 })
-  let cloud4Rellax = new Rellax(cloud4, { speed: 2 })
-  let cloud5Rellax = new Rellax(cloud5, { speed: 4 })
-  let cloud6Rellax = new Rellax(cloud6, { speed: 3 })
-  let cloud7Rellax = new Rellax(cloud7, { speed: 3 })
-  // ----------------------------------------
-  // TEMPLATE
-  // ----------------------------------------
-  const el = document.createElement('div')
-  const shadow = el.attachShadow(shopts)
-  shadow.innerHTML = `
-  <div class='header'>
-      <h1 class='title'></h1>
-      <section class='scene'>
-          <div class='sunCloud'>
-          </div>
-      </section>
-  </div>
-  <style></style>`
-  // ----------------------------------------
-  const style = shadow.querySelector('style')
-  const scene = shadow.querySelector('.scene')
-  const sunCloud = shadow.querySelector('.sunCloud')
-  const title = shadow.querySelector('.title')
-  await sdb.watch(onbatch)
-  scene.append(cloud3, cloud4, cloud5, cloud6, cloud7, playIsland)
-  sunCloud.append(cloud1, sun, cloud2)
-  
-  return el
-
-  function onbatch(batch) {
-    for (const {type, data} of batch) {
-      on[type](data)
-    }  
-  }
-  async function inject (data){
-    style.innerHTML = data.join('\n')
-  }
-  async function fill ([ opts ]) {
-    title.innerHTML = opts.title
-  }
-  async function scroll () {
-    el.scrollIntoView({behavior: 'smooth'})
-    el.tabIndex = '0'
-    el.focus()
-    el.onblur = () => {
-      el.tabIndex = '-1'
-      el.onblur = null
-    }
-  }
-}
-
 
 }).call(this)}).call(this,"/src/node_modules/header/header.js")
-},{"STATE":3,"graphic":8,"io":10,"rellax":1}],10:[function(require,module,exports){
-const taken = {}
-
-module.exports = io
-function io(seed, alias) {
-  if (taken[seed]) throw new Error(`seed "${seed}" already taken`)
-  // const pk = seed.slice(0, seed.length / 2)
-  // const sk = seed.slice(seed.length / 2, seed.length)
-  const self = taken[seed] = { id: seed, alias, peer: {} }
-  const io = { at, on }
-  return io
-
-  async function at (id, signal = AbortSignal.timeout(1000)) {
-    if (id === seed) throw new Error('cannot connect to loopback address')
-    if (!self.online) throw new Error('network must be online')
-    const peer = taken[id] || {}
-    // if (self.peer[id] && peer.peer[pk]) {
-    //   self.peer[id].close() || delete self.peer[id]
-    //   peer.peer[pk].close() || delete peer.peer[pk]
-    //   return console.log('disconnect')
-    // }
-    // self.peer[id] = peer
-    if (!peer.online) return wait() // peer with id is offline or doesnt exist
-    return connect()
-    function wait () {
-      const { resolve, reject, promise } = Promise.withResolvers()
-      signal.onabort = () => reject(`timeout connecting to "${id}"`)
-      peer.online = { resolve }
-      return promise.then(connect)
-    }
-    function connect () {
-      signal.onabort = null
-      const { port1, port2 } = new MessageChannel()
-      port2.by = port1.to = id
-      port2.to = port1.by = seed
-      self.online(self.peer[id] = port1)
-      peer.online(peer.peer[seed] = port2)
-      return port1
-    }
-  }
-  function on (online) { 
-    if (!online) return self.online = null
-    const resolve = self.online?.resolve
-    self.online = online
-    if (resolve) resolve(online)
-  }
-}
-},{}],11:[function(require,module,exports){
+},{"STATE":1,"graphic":31,"net_helper":18,"rellax":4}],33:[function(require,module,exports){
 async function loadSVG (url, done) { 
     const parser = document.createElement('div')
     let response = await fetch(url)
@@ -3008,1013 +11333,161 @@ async function loadSVG (url, done) {
 }
 
 module.exports = loadSVG
-},{}],12:[function(require,module,exports){
-/******************************************************************************
-  LOCALDB COMPONENT
-******************************************************************************/
-module.exports = localdb
-
-function localdb () {
-  const prefix = '153/'
-  return { add, read_all, read, drop, push, length, append, find, wash, gen_id }
-
-  function length (keys) {
-    const address = prefix + keys.join('/')
-    return Object.keys(localStorage).filter(key => key.includes(address)).length
-  }
-  /**
-   * Assigns value to the key of an object already present in the DB
-   * 
-   * @param {String[]} keys 
-   * @param {any} value 
-   */
-  function add (keys, value, precheck) {
-    localStorage[(precheck ? '' : prefix) + keys.join('/')] = JSON.stringify(value)
-  }
-  /**
-   * Appends values into an object already present in the DB
-   * 
-   * @param {String[]} keys 
-   * @param {any} value 
-   */
-  function append (keys, data) {
-    const pre = keys.join('/')
-    Object.entries(data).forEach(([key, value]) => {
-      localStorage[prefix + pre+'/'+key] = JSON.stringify(value)
-    })
-  }
-  /**
-   * Pushes value to an array already present in the DB
-   * 
-   * @param {String[]} keys
-   * @param {any} value 
-   */
-  function push (keys, value) {
-    const independent_key = keys.slice(0, -1)
-    const data = JSON.parse(localStorage[prefix + independent_key.join('/')])
-    data[keys.at(-1)].push(value)
-    localStorage[prefix + independent_key.join('/')] = JSON.stringify(data)
-  }
-  function read (keys) {
-    const result = localStorage[prefix + keys.join('/')]
-    return result && JSON.parse(result)
-  }
-  function read_all (addresses) {
-    let result = localStorage
-    addresses.forEach(address => {
-      const temp = {}
-      Object.entries(result).forEach(([key, value]) => {
-        if(key.includes(address))
-          temp[key] = value
-      })
-      result = temp
-    })
-    const temp = {}
-    Object.entries(result).forEach(([key, value]) => {
-      temp[key.replace(/^([^/]+\/){2}/, '')] = JSON.parse(value)
-    })
-    return temp
-  }
-  function drop (keys) {
-    if(keys.length > 1){
-      const data = JSON.parse(localStorage[keys[0]])
-      let temp = data
-      keys.slice(1, -1).forEach(key => {
-        temp = temp[key]
-      })
-      if(Array.isArray(temp))
-        temp.splice(keys[keys.length - 1], 1)
-      else
-        delete(temp[keys[keys.length - 1]])
-      localStorage[keys[0]] = JSON.stringify(data)
-    }
-    else
-      delete(localStorage[keys[0]])
-  }
-  function find (keys, filters, index = 0) {
-    let index_count = 0
-    const address = prefix + keys.join('/')
-    const target_key = Object.keys(localStorage).find(key => {
-      if(key.includes(address)){
-        const entry = JSON.parse(localStorage[key])
-        let count = 0
-        Object.entries(filters).some(([search_key, value]) => {
-          if(entry[search_key] !== value)
-            return
-          count++
-        })
-        if(count === Object.keys(filters).length){
-          if(index_count === index)
-            return key
-          index_count++
-        }
-      }
-    }, undefined)
-    return target_key && JSON.parse(localStorage[target_key])
-  } 
-  function wash () {
-    localStorage.clear()
-  }
-  function gen_id (raw_id) {
-    const seed = raw_id.replace(/:0$/, "")
-    const copies = Object.keys(read_all(['state', seed]))
-    if (copies.length) {
-      const id = copies.sort().at(-1).split(':')[1]
-      raw_id = seed + ':' + (Number(id || 0) + 1)
-    }
-    return raw_id
-  }
-}
-},{}],13:[function(require,module,exports){
+},{}],34:[function(require,module,exports){
 (function (__filename){(function (){
-/******************************************************************************
-  STATE
-******************************************************************************/
 const STATE = require('STATE')
-const name = 'theme_editor'
 const statedb = STATE(__filename)
-// ----------------------------------------
-const { sdb, subs: [get] } = statedb(fallback_module, fallback_instance)
-function fallback_module () { 
-  return {}
-}
-function fallback_instance () {
-  return {
-    inputs: {
-      'theme_editor.css': {
-        $ref: new URL('src/node_modules/css/default/theme_editor.css', location).href
-      }
-    }
-  }
-}
-/******************************************************************************
-  THEME_EDITOR COMPONENT
-******************************************************************************/
-const DB = require('localdb')
-const IO = require('io')
-// ----------------------------------------
-const shopts = { mode: 'closed' }
-// ----------------------------------------
-module.exports = theme_editor
-async function theme_editor (opts) {
-  // ----------------------------------------
-  // ID + JSON STATE
-  // ----------------------------------------
-  const { id, sdb } = await get(opts.sid) // hub is "parent's" io "id" to send/receive messages
-  const status = { tab_id: 0 }
-  const db = DB()
+const { get } = statedb(defaults)
+const net = require('net_helper')
+const graphic = require('graphic')
+
+module.exports = topnav
+
+async function topnav (opts, invite) {
+  const { id, sdb } = await get(opts.sid)
+  const { drive } = sdb
   const on = {
-    init,
-    hide,
-    css: inject
+    style: inject,
+    content: fill
   }
-  const {xget} = sdb.req_access(opts.sid)
-  const send = await IO(id, name, on)
-  
-  status.themes = {
-    builtin: Object.keys(opts.paths),
-    saved: Object.keys(JSON.parse(localStorage.index || (localStorage.index = '{}')))
-  }
-  // ----------------------------------------
-  // TEMPLATE
-  // ----------------------------------------
+  const { io, _ } = net(id)
+  io.on = { app: io_app() }
+  if (invite) io.accept(invite)
+
+  const logo = await graphic('playLogo', './src/node_modules/assets/svg/logo.svg')
   const el = document.createElement('div')
-  const shadow = el.attachShadow(shopts)
-  const style = document.createElement('style')
-  await sdb.watch(onbatch)
-
+  const shadow = el.attachShadow({ mode: 'closed' })
   shadow.innerHTML = `
-  <main>
-    <div class="content">
-    </div>
-    <div class="relative">
-      <input list="themes" class="theme" placeholder='Enter theme' />
-      <div id="themes" class="theme"></div>
-    </div>
-    <button class="load single">
-      Load
-    </button>
-    <button class="inject">
-      Inject
-    </button>
-    <button class="save_file single">
-      Save file
-    </button>
-    <button class="save_pref">
-      Save pref
-    </button>
-    <button class="drop_theme single">
-      Drop theme
-    </button>
-    <button class="drop_file single">
-      Drop file
-    </button>
-    <button class="reset single">
-      Reset
-    </button>
-    <button class="export single">
-      Export
-    </button>
-    <button class="import single">
-      Import
-    </button>
-    <input style="display: none;" class="upload" type='file' />
-    <button class="add">
-      Add
-    </button>
-    <h3>
-    </h3>
-    <div class="tabs">
-      <div class="box"></div>
-      <span class="plus">+</span>
-    </div>
-  </main>`
-  const main = shadow.querySelector('main')
-  const inject_btn = shadow.querySelector('.inject')
-  const load_btn = shadow.querySelector('.load')
-  const save_file_btn = shadow.querySelector('.save_file')
-  const save_pref_btn = shadow.querySelector('.save_pref')
-  const add_btn = shadow.querySelector('.add')
-  const drop_theme_btn = shadow.querySelector('.drop_theme')
-  const drop_file_btn = shadow.querySelector('.drop_file')
-  const reset_btn = shadow.querySelector('.reset')
-  const upload = shadow.querySelector('.upload')
-  const import_btn = shadow.querySelector('.import')
-  const export_btn = shadow.querySelector('.export')
-  const title = shadow.querySelector('h3')
-  const content = shadow.querySelector('.content')
-  const tabs = shadow.querySelector('.tabs > .box')
-  const plus = shadow.querySelector('.plus')
-  const select_theme = shadow.querySelector('div.theme')
-  const input = shadow.querySelector('input.theme')
-
-  input.onfocus = () => select_theme.classList.add('active')
-  input.onblur = () => setTimeout(() => select_theme.classList.remove('active'), 200)
-  input.oninput = update_select_theme
-  inject_btn.onclick = on_inject
-  load_btn.onclick = () => load(input.value, false)
-  save_file_btn.onclick = save_file
-  save_pref_btn.onclick = save_pref
-  add_btn.onclick = () => add(input.value)
-  drop_theme_btn.onclick = drop_theme
-  drop_file_btn.onclick = drop_file
-  export_btn.onclick = export_fn
-  import_btn.onclick = () => upload.click()
-  upload.onchange = import_fn
-  reset_btn.onclick = () => {localStorage.clear(), location.reload()}
-  plus.onclick = () => add_tab('New')
-  shadow.append(style)
-  update_select_theme()
-  
-  return el
-
-  function onbatch(batch){
-    for (const {type, data} of batch) {
-      on[type](data)
-    }  
-  }
-  async function hide () {
-    main.classList.toggle('select')
-    status.select = !status.select
-  }
-  async function export_fn () {
-    const theme = db.read([ input.value ])
-    const index = db.read([ 'index', input.value ])
-    const blob = new Blob([JSON.stringify({theme, index}, null, 2)], { type: "application/json" })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement("a")
-    a.href = url
-    a.download = input.value
-    document.body.appendChild(a)
-    a.click()
-    document.body.removeChild(a)
-    URL.revokeObjectURL(url)
-  }
-  async function import_fn () {
-    const file = upload.files[0]
-    const name = file.name.split('.')[0]
-    await add(name)
-    const reader = new FileReader()
-    reader.onload = e => {
-      const blob = JSON.parse(e.target.result)
-      db.add([name], blob.theme)
-      db.add(['index', name], blob.index)
-      load(name)
-    }
-    reader.readAsText(file)
-  }
-  async function add (theme) {
-    db.add([theme], [])
-    status.themes.saved.push(theme)
-    db.add(['index', theme], [])
-    update_select_theme()
-  }
-  async function drop_theme () {
-    db.drop([input.value])
-    db.drop(['index', input.value])
-    status.themes.saved = status.themes.saved.filter(v => v != input.value)
-    update_select_theme()
-    input.value = 'default'
-    load('default')
-  }
-  async function drop_file () {
-    db.drop([status.active_tab.dataset.theme, status.active_tab.dataset.id])
-    db.drop(['index', status.active_tab.dataset.theme, status.active_tab.dataset.id])
-    close_tab(status.active_tab)
-  }
-  async function forget_changes () {
-    status.active_el.classList.remove('dirty')
-    const dirt = JSON.parse(localStorage.dirt)
-    delete(dirt[status.title])
-    localStorage.dirt = JSON.stringify(dirt)
-  }
-  async function save_file () {
-    // forget_changes()
-    if(db.read([input.value])){
-      db.push(['index', input.value], status.active_tab.dataset.name)
-      db.push([input.value], status.textarea.value)
-    }
-  }
-  async function save_pref () {
-    const pref = db.read(['pref'])
-    if(status.select){
-      var ids = await get_select()
-      ids.forEach(id => pref[id] = [])
-    }
-    pref[status.instance_id] = []
-    pref[status.title] = []
-    Array.from(tabs.children).forEach(tab => {
-      if(tab.dataset.access === "uniq"){
-        if(ids)
-          ids.forEach(id => 
-          pref[id].push({theme: tab.dataset.theme, id: tab.dataset.id, local: status.themes.builtin.includes(tab.dataset.theme)})
-        )
-        else
-          pref[status.instance_id].push({theme: tab.dataset.theme, id: tab.dataset.id, local: status.themes.builtin.includes(tab.dataset.theme)})
-      }
-      else
-        pref[status.title].push({theme: tab.dataset.theme, id: tab.dataset.id, local: status.themes.builtin.includes(tab.dataset.theme) })
-    })
-    db.add(['pref'], pref)
-  }
-  async function unsave () {
-    status.active_el.classList.add('dirty')
-    let theme = localStorage[input.value] && JSON.parse(localStorage[input.value])
-    if(theme){
-      theme.css[status.title] = textarea.value
-      localStorage[input.value] = JSON.stringify(theme)
-      const dirt = JSON.parse(localStorage.dirt)
-      dirt[status.title] = input.value
-      localStorage.dirt = JSON.stringify(dirt)
-    }
-    else{
-      const name = input.value + '*'
-      theme = localStorage[name] && JSON.parse(localStorage[name])
-      if(theme){
-        theme.css[status.title] = textarea.value
-        localStorage[name] = JSON.stringify(theme)
-        const dirt = JSON.parse(localStorage.dirt)
-        dirt[status.title] = name
-        localStorage.dirt = JSON.stringify(dirt)
-      }
-      else{
-        theme = { theme: true, css: {} }
-        theme.css[status.title] = textarea.value
-        localStorage[name] = JSON.stringify(theme)
-        status.themes.saved.push(name)
-        const dirt = JSON.parse(localStorage.dirt)
-        dirt[status.title] = name
-        localStorage.dirt = JSON.stringify(dirt)
-        update_select_theme()
-        input.value = name
-      }
-    }
-  }
-  async function on_inject () {
-    if(status.active_tab.dataset.type === 'json'){
-      const id = add_data(status.textarea.value)
-      const hub = xget(xget(id).hub).id
-      send({type: 'refresh', to: hub})
-    }
-    else{
-      if(status.select){
-        const ids = await get_select()
-        ids.forEach(id => {
-          send({ type: 'inject', to: id, data: status.textarea.value })
-        })
-      }
-      else
-        send({ type: 'inject', to: status.node_data.hub_id, data: status.textarea.value })
-    }
-  }
-  async function get_select () {
-    return await send({ type: 'get_select', to: 'theme_widget'})
-  }
-  async function load (theme, clear = true) {
-    if(clear){
-      content.innerHTML = ''
-      tabs.innerHTML = ''
-    }
-    if(status.themes.builtin.includes(theme)){
-      const index = opts.paths[theme].length
-      for(let i = 0; i < index; i++){
-        const temp = await fetch(`./src/node_modules/css/${theme}/${i}.css`)
-        add_tab(i, await temp.text(), '', theme, status.title)
-      }
-    }
-    else{
-      const temp = db.read([theme])
-      temp.forEach((file, i) => {
-          add_tab(i, file, '', theme, status.title)
-      })
-    }
-    // forget_changes()
-  }
-  async function init ({ data }) {
-    title.innerHTML = data.id
-    status.title = data.type
-    status.instance_id = data.id
-    let value = data.file ? db.read([data.xtype, data.id]) : data
-    if(data.type === 'json' || !data.file)
-      value = JSON.stringify(value, null, 2)
-    add_tab(data.name, value)
-  }
-  async function add_tab (id, value = '', access = 'uniq', theme = 'default') {
-    if(id === 'New' && status.themes.builtin.includes(theme)){
-      theme += '*'
-      add(theme)
-    }
-    const tab = document.createElement('span')
-    const tab_id = '_' + status.tab_id++
-    tab.id = tab_id
-    const index = opts.paths[theme] || db.read(['index', theme])
-    tabs.append(tab)
-    const btn = document.createElement('span')
-    btn.innerHTML = index[id] || id
-    tab.dataset.id = id
-    tab.dataset.name = btn.innerHTML
-    tab.dataset.theme = theme
-    tab.dataset.access = access
-    btn.onclick = () => switch_tab(tab.id)
-    btn.ondblclick = rename
-    const btn_x = document.createElement('span')
-    btn_x.innerHTML = 'x'
-    tab.append(btn, btn_x)
-    tab.tabIndex = '0'
-    tab.onkeydown = e => {
-      if(e.key === 'ArrowRight' && tab.nextElementSibling)
-        tab.nextElementSibling.after(tab)
-      else if(e.key === 'ArrowLeft' && tab.previousElementSibling)
-        tab.previousElementSibling.before(tab)
-      tab.focus()
-    }
-    const textarea = document.createElement('textarea')
-    textarea.value = value
-    textarea.id = tab_id
-    content.append(textarea)
-    btn_x.onclick = () => close_tab(tab)
-    switch_tab(tab_id)
-  }
-  async function close_tab (tab) {
-    content.querySelector('#' + tab.id).remove()
-    tab.remove()
-    if(tabs.children.length)
-      switch_tab(tabs.children[tabs.children.length - 1].id)
-    else
-      add_tab('New')
-  }
-  async function switch_tab (tab_id) {
-    status.textarea && status.textarea.classList.remove('active')
-    status.textarea = content.querySelector('#' + tab_id)
-    status.textarea.classList.add('active')
-    status.active_tab && status.active_tab.classList.remove('active')
-    status.active_tab = tabs.querySelector('#' + tab_id)
-    status.active_tab.classList.add('active')
-    status.active_tab.focus()
-    input.value = status.active_tab.dataset.theme
-  }
-  async function rename (e) {
-    const btn = e.target
-    const hub = btn.parentElement
-    const input = document.createElement('input')
-    input.value = btn.innerHTML
-    btn.innerHTML = ''
-    btn.append(input)
-    input.onkeydown = e => {
-      if(e.key === 'Enter'){
-        btn.innerHTML = input.value
-        db.add([hub.dataset.theme, hub.dataset.id], input.value)
-      }
-    }
-    input.onblur = e => {
-      if(e.relatedTarget)
-        btn.innerHTML = hub.dataset.name
-    }
-    input.focus()
-  }
-  async function update_select_theme () {
-    const builtin = document.createElement('div')
-    builtin.classList.add('cat')
-    status.themes.builtin.forEach(theme => {
-      const el = document.createElement('div')
-      el.innerHTML = theme
-      el.onclick = () => input.value = theme
-      theme.includes(input.value) && builtin.append(el)
-    })
-    builtin.innerHTML && builtin.insertAdjacentHTML('afterbegin', '<b>builtin</b>')
-    const saved = document.createElement('div')
-    saved.classList.add('cat')
-    status.themes.saved.forEach(theme => {
-      const el = document.createElement('div')
-      el.innerHTML = theme
-      el.onclick = () => input.value = theme
-      theme.includes(input.value) && saved.append(el)
-    })
-    saved.innerHTML && saved.insertAdjacentHTML('afterbegin', '<b>saved</b>')
-    select_theme.innerHTML = ''
-    select_theme.append(builtin, saved)
-  }
-  async function inject (data){
-    style.innerHTML = data.join('\n')
-  }
-}
-
-}).call(this)}).call(this,"/src/node_modules/theme_editor/theme_editor.js")
-},{"STATE":3,"io":10,"localdb":12}],14:[function(require,module,exports){
-(function (__filename){(function (){
-/******************************************************************************
-  STATE
-******************************************************************************/
-const STATE = require('STATE')
-const name = 'theme_widget'
-const statedb = STATE(__filename)
-const shopts = { mode: 'closed' }
-// ----------------------------------------
-const { sdb, subs: [get] } = statedb(fallback_module, fallback_instance)
-function fallback_module () { 
-  return {
-    _: {
-      'theme_editor': {},
-      'graph_explorer': {}
-    }
-  }
-}
-function fallback_instance () {
-  return {
-    _: {
-      'theme_editor': {},
-      'graph_explorer': {}
-    },
-    inputs: {
-      'theme_widget.css': {
-        $ref: new URL('src/node_modules/css/default/theme_widget.css', location).href
-      }
-    }
-  }
-}
-/******************************************************************************
-  THEME_WIDGET COMPONENT
-******************************************************************************/
-const theme_editor = require('theme_editor')
-const graph_explorer = require('graph_explorer')
-const IO = require('io')
-// ----------------------------------------
-module.exports = theme_widget
-
-async function theme_widget (opts) {
-  // ----------------------------------------
-  // ID + JSON STATE
-  // ----------------------------------------
-  const { id, sdb } = await get(opts.sid) // hub is "parent's" io "id" to send/receive messages
-  const status = { tab_id: 0, init_check: true }
-  const on = {
-    refresh,
-    get_select,
-    css: inject,
-    scroll,
-    click
-  }
-  const {get_all} = sdb.req_access(opts.sid)
-  const send = await IO(id, name, on)
-
-  status.clickables = ['css', 'json', 'js']
-  status.dirts = JSON.parse(localStorage.dirt || (localStorage.dirt = '{}'))
-  localStorage.pref || (localStorage.pref = '{}')
-  const paths =  JSON.parse(await(await fetch('./src/node_modules/css/index.json')).text())
-  // ----------------------------------------
-  // TEMPLATE
-  // ----------------------------------------
-  const el = document.createElement('div')
-  const shadow = el.attachShadow(shopts)
-  shadow.innerHTML = `
-  <section>
-    <div class="btn">
-      ⚙️
-    </div>
-    <div class="popup">
-      <div class="box">
-        <span class="stats">
-          Entries: 
-        </span>
-        <button class="select">Select</button>
-        <input min="0" max="100" value="75" type="range"/>
-      </div>
-      <div class="editor">
-      </div>
-    </div>
+  <section class="topnav">
+    <a href="#top"></a>
+    <nav class="menu"></nav>
   </section>
   <style></style>`
   const style = shadow.querySelector('style')
-  const btn = shadow.querySelector('.btn')
-  const popup = shadow.querySelector('.popup')
-  const box = popup.querySelector('.box')
-  const list = box.querySelector('.list')
-  const editor = popup.querySelector('.editor')
-  const stats = box.querySelector('.stats')
-  const select = box.querySelector('.select')
-  const slider = box.querySelector('input')
+  const menu = shadow.querySelector('.menu')
+  const body = shadow.querySelector('section')
+  const home = shadow.querySelector('a')
+  home.append(logo)
+  home.onclick = onhome_click
+  let last_scroll = 0
+  window.addEventListener('scroll', onwindow_scroll)
+  window.addEventListener('resize', onwindow_resize)
 
-  const theme_editor_sub = sdb.get_sub('theme_editor')
-  const graph_explorer_sub = sdb.get_sub('graph_explorer')
   await sdb.watch(onbatch)
 
-  editor.append(await theme_editor({ sid: theme_editor_sub[0].sid, hub: [id], paths }))
-  box.prepend(await graph_explorer({ sid: graph_explorer_sub[0].sid, hub: [id] }))
-  select.onclick = on_select
-  slider.oninput = blur
   return el
 
-  function onbatch(batch){
-    for (const {type, data} of batch) {
-      on[type](data)
-    }  
-  }
-  async function blur(e) {
-    popup.style.opacity = e.target.value/100
-  }
-  async function on_select () {
-    list.classList.toggle('active')
-    send({to: 'theme_editor', type: 'hide'})
-  }
-  async function get_select () {
-    const inputs = list.querySelectorAll('input')
-    const output = []
-    inputs.forEach(el => el.checked && output.push(el.nextElementSibling.id))
-    send({type: 'send', to: 'theme_editor', data: output})
-  }
-  async function refresh () {
-    const data = get_all()
-    status.tree = data
-    stats.innerHTML = `Entries: ${Object.keys(data).length}`
-    btn.onclick = () => {
-      popup.classList.toggle('active')
-      status.init_check && send({type: 'init', to: 'graph_explorer' , data:status.tree})
-      status.init_check = false
+  async function onbatch (batch) {
+    for (const { type, paths } of batch) {
+      const data = await Promise.all(paths.map(path => drive.get(path).then(file => file.raw)))
+      const func = on[type] || fail
+      func(data, type)
     }
   }
-  async function click ({ data }) {
-    send({ to: 'theme_editor', type: 'init', data})
-    status.active_el && status.active_el.classList.remove('active')
-    if(status.instance_id === data.id)
-      editor.classList.toggle('active')
-    else{
-      editor.classList.add('active')
-      el.classList.add('active')
-    }
-    status.instance_id = data.id
-    status.active_el = el
+  function fail (data, type) { console.warn('topnav: invalid batch', { cause: { data, type } }) }
+  function inject (data) { style.textContent = data.join('\n') }
+  function fill ([content]) {
+    const { links } = typeof content === 'string' ? JSON.parse(content) : content
+    menu.replaceChildren(...links.map(make_link))
   }
-  async function scroll () {
-    el.scrollIntoView({behavior: 'smooth'})
-    el.tabIndex = '0'
-    el.focus()
-    el.onblur = () => {
-      el.tabIndex = '-1'
-      el.onblur = null
+  function make_link (link) {
+    const a = document.createElement('a')
+    a.href = `#${link.url}`
+    a.textContent = link.text
+    a.onclick = onlink_click
+    return a
+
+    function onlink_click (event) {
+      event.preventDefault()
+      _.app('jump', {}, { to: link.url })
     }
   }
-  async function inject (data){
-    style.innerHTML = data.join('\n')
+  function onhome_click (event) {
+    event.preventDefault()
+    _.app('jump', {}, { to: 'top' })
   }
+  // scroll classes only follow the window scroll position, nothing to restore
+  function onwindow_scroll () {
+    if (window.innerWidth < 1024) return
+    const current = window.pageYOffset
+    if (current < 1) return body.classList.remove('scrollUp', 'scrollDown')
+    if (current > last_scroll && !body.classList.contains('scrollDown')) {
+      body.classList.add('scrollDown')
+      body.classList.remove('scrollUp')
+    } else if (current < last_scroll) {
+      body.classList.add('scrollUp')
+      body.classList.remove('scrollDown')
+    }
+    last_scroll = current
+  }
+  function onwindow_resize () {
+    if (window.innerWidth <= 1024) body.classList.remove('scrollUp', 'scrollDown')
+  }
+  function io_app () {
+    return function onmessage_from_app (msg) {
+      const handlers = { scroll }
+      const handler = handlers[msg.type] || fail_message
+      handler(msg)
+    }
+  }
+  function scroll () { el.scrollIntoView({ behavior: 'smooth' }) }
+  function fail_message (msg) { console.warn('topnav: unknown message', msg) }
 }
 
-}).call(this)}).call(this,"/src/node_modules/theme_widget/theme_widget.js")
-},{"STATE":3,"graph_explorer":6,"io":10,"theme_editor":13}],15:[function(require,module,exports){
-module.exports={
-  "inputs": {
-    "topnav.json": {
-      "type": "content",
-      "data": {
-        "links": [
-        {
-          "id": "datdot",
-          "text": "DatDot",
-          "url": "datdot"
+function defaults () {
+  return {
+    api,
+    _: {
+      net_helper: { $: '' },
+      graphic: { $: '' }
+    },
+    drive: {}
+  }
+  function api () {
+    return {
+      _: {
+        net_helper: { 0: '' },
+        graphic: { 0: '' }
+      },
+      drive: {
+        'style/': {
+          'topnav.css': { $ref: '../css/default/topnav.css' }
         },
-        {
-          "id": "editor",
-          "text": "Play Editor",
-          "url": "editor"
-        },
-        {
-          "id": "smartcontract_codes",
-          "text": "Smart Contract Codes",
-          "url": "smartcontract_codes"
-        },
-        {
-          "id": "supporters",
-          "text": "Supporters",
-          "url": "supporters"
-        },
-        {
-          "id": "our_contributors",
-          "text": "Contributors",
-          "url": "our_contributors"
+        'content/': {
+          'topnav.json': { $ref: 'topnav.json' }
         }
-      ]
       }
     }
   }
-
-}
-},{}],16:[function(require,module,exports){
-(function (__filename){(function (){
-/******************************************************************************
-  STATE
-******************************************************************************/
-const STATE = require('STATE')
-const name = 'topnav'
-const statedb = STATE(__filename)
-// ----------------------------------------
-const { sdb, subs: [get] } = statedb(fallback_module, fallback_instance)
-function fallback_module () { 
-	return {}
-}
-function fallback_instance () { 
-	const data = require('./instance.json')
-	data.inputs['topnav.css'] = {
-		$ref: new URL('src/node_modules/css/default/topnav.css', location).href
-	}
-	return data 
-}
-
-/******************************************************************************
-  OUR CONTRIBUTORS COMPONENT
-******************************************************************************/
-const graphic = require('graphic')
-const IO = require('io')
-// ----------------------------------------
-const shopts = { mode: 'closed' }
-// ----------------------------------------
-module.exports = topnav
-
-async function topnav (opts) {
-	// ----------------------------------------
-	// ID + JSON STATE
-	// ----------------------------------------
-	const { id, sdb } = await get(opts.sid) 
-	const status = {}
-	const on = {
-		css: inject,
-		scroll,
-		content: fill
-	}
-	
-  const send = await IO(id, name, on)
-	// ----------------------------------------
-	// OPTS
-	// ----------------------------------------
-
-	const playLogo = await graphic('playLogo', './src/node_modules/assets/svg/logo.svg')
-	// ----------------------------------------
-	// TEMPLATE
-	// ----------------------------------------
-	const el = document.createElement('div')
-	const shadow = el.attachShadow(shopts)
-	shadow.innerHTML = `
-		<section class='topnav'>
-				<a href="#top">${playLogo.outerHTML}</a>
-				<nav class='menu'>
-				</nav>
-		</section>
-	<style></style>`
-  const style = shadow.querySelector('style')
-	const menu = shadow.querySelector('.menu')
-	const body = shadow.querySelector('section')
-	const scrollUp = 'scrollUp'
-	const scrollDown = 'scrollDown'
-	let lastScroll = 0
-	
-	window.addEventListener('scroll', ()=> {
-		if (window.innerWidth >= 1024) {
-			let currentScroll = window.pageYOffset
-			if (currentScroll < 1) {
-					body.classList.remove(scrollUp)
-					body.classList.remove(scrollDown)
-					return
-			}
-			if (currentScroll > lastScroll && !body.classList.contains(scrollDown)) {
-					body.classList.add(scrollDown)
-					body.classList.remove(scrollUp)
-			} else if (currentScroll < lastScroll) {
-					body.classList.add(scrollUp)
-					body.classList.remove(scrollDown)
-			}
-			lastScroll = currentScroll
-		}
-	})
-
-	window.addEventListener('resize', ()=> {
-		if (window.innerWidth <= 1024) {
-			body.classList.remove(scrollUp)
-			body.classList.remove(scrollDown)
-		}
-	})
-	sdb.watch(onbatch)
-  
-	return el
-
-	function onbatch(batch){
-		for (const {type, data} of batch) {
-      on[type](data)
-    }  
-	}
-	async function inject (data){
-		style.innerHTML = data.join('\n')
-	}
-	function fill ([ opts ]) { 
-		menu.replaceChildren(...opts.links.map(make_link))
-	}
-	function click(url) {
-		send({to:'index', type: 'jump', data: url })
-	}
-	function make_link(link){
-		const a = document.createElement('a')
-		a.href = `#${link.url}`
-		a.textContent = link.text
-		a.onclick = () => click(link.url)
-		return a
-	}
-	async function scroll () {
-		el.scrollIntoView({behavior: 'smooth'})
-		el.tabIndex = '0'
-		el.focus()
-		el.onblur = () => {
-			el.tabIndex = '-1'
-			el.onblur = null
-		}
-	}
 }
 
 }).call(this)}).call(this,"/src/node_modules/topnav/topnav.js")
-},{"./instance.json":15,"STATE":3,"graphic":8,"io":10}],17:[function(require,module,exports){
-patch_cache_in_browser(arguments[4], arguments[5])
-
-function patch_cache_in_browser (source_cache, module_cache) {
-  const meta = { modulepath: [], paths: {} }
-  for (const key of Object.keys(source_cache)) {
-    const [module, names] = source_cache[key]
-    const dependencies = names || {}
-    source_cache[key][0] = patch(module, dependencies, meta)
-  }
-  function patch (module, dependencies, meta) {
-    const MAP = {}
-    for (const [name, number] of Object.entries(dependencies)) MAP[name] = number
-    return (...args) => {
-      const original = args[0]
-      require.cache = module_cache
-      require.resolve = resolve
-      args[0] = require
-      return module(...args)
-      function require (name) {
-        const identifier = resolve(name)
-        if (name.endsWith('node_modules/STATE')) {
-          const modulepath = meta.modulepath.join('/')
-          const original_export = require.cache[identifier] || (require.cache[identifier] = original(name))
-          const exports = (...args) => original_export(...args, modulepath)
-          return exports
-        } else if (require.cache[identifier]) return require.cache[identifier]
-        else {
-          const counter = meta.modulepath.concat(name).join('/')
-          if (!meta.paths[counter]) meta.paths[counter] = 0
-          const localid = `${name}${meta.paths[counter] ? '#' + meta.paths[counter] : ''}`
-          meta.paths[counter]++
-          meta.modulepath.push(localid)
-        }
-        const exports = require.cache[identifier] = original(name)
-        if (!name.endsWith('node_modules/STATE')) meta.modulepath.pop(name)
-        return exports
-      }
-    }
-    function resolve (name) { return MAP[name] }
-  }
-}
-require('./demo') // or whatever is otherwise the main entry of our project
-
-},{"./demo":18}],18:[function(require,module,exports){
-(function (__filename,__dirname){(function (){
-const STATE = require('../src/node_modules/STATE')
-/******************************************************************************
-  INITIALIZE PAGE
-******************************************************************************/
-const statedb = STATE(__filename)
-const { sdb, subs: [get] } = statedb(fallback_module, fallback_instance)
-
-const make_page = require('../src/app')
-
-function fallback_module () { // -> set database defaults or load from database
-  return {
-    admins: ['theme_editor', 'theme_widget', 'graph_explorer'],
-    _: {
-      app: {}
-    }
-  }
-}
-function fallback_instance () {
-  return {
-    _: {
-      app: {
-        0: override
-      }
-    },
-    inputs: {
-      'demo.css': {
-        $ref: new URL('src/node_modules/css/default/demo.css', location).href
-      }
-    }
-  }
-}
-function override ([app], path) {
-  const data = app()
-  console.log(path._.app._.topnav)
-  return data
-}
-/******************************************************************************
-  CSS & HTML Defaults
-******************************************************************************/
-const sheet = new CSSStyleSheet()
-config().then(() => boot({ }))
+},{"STATE":1,"graphic":31,"net_helper":18}],35:[function(require,module,exports){
+const app = require('../src/app')
+config().then(boot)
 
 async function config () {
-  const path = path => new URL(`../src/node_modules/${path}`, `file://${__dirname}`).href.slice(8)
   const html = document.documentElement
   const meta = document.createElement('meta')
-  const appleTouch = '<link rel="apple-touch-icon" sizes="180x180" href="./src/node_modules/assets/images/favicon/apple-touch-icon.png">'
-  const icon32 = '<link rel="icon" type="image/png" sizes="32x32" href="./src/node_modules/assets/images/favicon/favicon-32x32.png">'
-  const icon16 = '<link rel="icon" type="image/png" sizes="16x16" href="./src/node_modules/assets/images/favicon/favicon-16x16.png">'
-  const webmanifest = '<link rel="manifest" href="./src/node_modules/assets/images/favicon/site.webmanifest"></link>'
+  const icons = './src/node_modules/assets/images/favicon/'
   const font = 'https://fonts.googleapis.com/css?family=Nunito:300,400,700,900|Slackey&display=swap'
-  const loadFont = `<link href=${font} rel='stylesheet' type='text/css'>`
   html.setAttribute('lang', 'en')
   meta.setAttribute('name', 'viewport')
   meta.setAttribute('content', 'width=device-width,initial-scale=1.0')
-  // @TODO: use font api and cache to avoid re-downloading the font data every time
   document.head.append(meta)
-  document.head.innerHTML += appleTouch + icon16 + icon32 + webmanifest + loadFont
-  document.adoptedStyleSheets = [sheet]
-  await document.fonts.ready // @TODO: investigate why there is a FOUC
+  document.head.insertAdjacentHTML('beforeend', `
+    <link rel="apple-touch-icon" sizes="180x180" href="${icons}apple-touch-icon.png">
+    <link rel="icon" type="image/png" sizes="32x32" href="${icons}favicon-32x32.png">
+    <link rel="icon" type="image/png" sizes="16x16" href="${icons}favicon-16x16.png">
+    <link rel="manifest" href="${icons}site.webmanifest">
+    <link href="${font}" rel="stylesheet" type="text/css">`)
+  document.title = 'Playproject.io'
+  document.body.removeAttribute('style')
+  await document.fonts.ready
 }
-/******************************************************************************
-  PAGE BOOT
-******************************************************************************/
+
 async function boot () {
-  // ----------------------------------------
-  // ID + JSON STATE
-  // ----------------------------------------
-  const { id, sdb } = await get('') // hub is "parent's" io "id" to send/receive messages
-  const [opts] = sdb.get_sub('app')
-  const on = {
-    css: inject
-  }
-  sdb.watch(onbatch)
-  const status = {}
-  // ----------------------------------------
-  // TEMPLATE
-  // ----------------------------------------
-  const el = document.body
-  const shopts = { mode: 'closed' }
-  const shadow = el.attachShadow(shopts)
-  shadow.adoptedStyleSheets = [sheet]
-  // ----------------------------------------
-  // ELEMENTS
-  // ----------------------------------------
-  { // desktop
-    const element = await make_page(opts)
-    shadow.append(element)
-  }
-  // ----------------------------------------
-  // INIT
-  // ----------------------------------------
-
-  function onbatch (batch) {
-    for (const { type, data } of batch) {
-      on[type](data)
-    }
-  }
-}
-async function inject (data) {
-  sheet.replaceSync(data.join('\n'))
+  document.body.append(await app())
 }
 
-}).call(this)}).call(this,"/web/demo.js","/web")
-},{"../src/app":2,"../src/node_modules/STATE":3}]},{},[17]);
+},{"../src/app":29}]},{},[35]);
