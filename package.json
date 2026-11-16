@@ -4,8 +4,8 @@
   "description": "Playproject.io official landing page",
   "main": "src/app.js",
   "scripts": {
-    "start": "budo web/page.js:bundle.js --dir . --live --open -- -i STATE",
-    "build": "browserify web/page.js -i STATE -o bundle.js",
+    "start": "NODE_PATH=$PWD/node_modules/ui-components/src/node_modules budo web/page.js:bundle.js --dir . --live --open -- -i STATE",
+    "build": "NODE_PATH=$PWD/node_modules/ui-components/src/node_modules browserify web/page.js -i STATE -o bundle.js",
     "lint": "standardx --fix",
     "start:doc": "budo doc/state/example/boot.js:doc/state/example/bundle.js  --dir ./ --live --open",
     "build:doc": "browserify doc/state/example/boot.js > doc/state/example/bundle.js",
@@ -49,6 +49,7 @@
     "browserify": "^17.0.1"
   },
   "dependencies": {
-    "rellax": "^1.12.0"
+    "rellax": "^1.12.0",
+    "ui-components": "github:ddroid/ui-components"
   }
 }
