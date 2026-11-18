@@ -128,8 +128,7 @@ function defaults () {
   const mapping = { style: 'style' }
   const drive = {
     'style/': {
-      'app.css': { $ref: 'node_modules/css/default/app.css' },
-      'devkit.css': { $ref: 'node_modules/css/default/devkit.css' }
+      'app.css': { $ref: 'node_modules/css/default/app.css' }
     },
     'content/': {},
     // tabs inside devkit maps a "count" dataset up to the root
@@ -157,8 +156,8 @@ function defaults () {
   function api () {
     return {
       _: {
-        net_helper: 0,
-        DOCS: 0,
+        net_helper: { 0: '' },
+        DOCS: { 0: '' },
         topnav: section,
         header: section,
         footer: section,

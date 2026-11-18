@@ -69,8 +69,14 @@ function defaults () {
   }
   return {
     _: {
-      '../src/app': { $: '', 0: '', mapping }
+      '../src/app': { $: '', 0: override_app, mapping }
     },
     drive
+  }
+  // the page's own style for the devkit panel, the $ref is relative to web/
+  function override_app (args, tools, [app]) {
+    const data = app()
+    data.drive['style/']['devkit.css'] = { $ref: 'devkit.css' }
+    return data
   }
 }
