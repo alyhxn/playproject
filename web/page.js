@@ -2,7 +2,9 @@ const STATE = require('STATE')
 const statedb = STATE(__filename)
 statedb.admin()
 const { sdb } = statedb(defaults)
+const { drive } = sdb
 const app = require('../src/app')
+const sheet = new CSSStyleSheet()
 config().then(boot)
 
 async function config () {
@@ -22,14 +24,30 @@ async function config () {
     <link href="${font}" rel="stylesheet" type="text/css">`)
   document.title = 'Playproject.io'
   document.body.removeAttribute('style')
+  document.adoptedStyleSheets = [sheet]
   await document.fonts.ready
 }
 
 async function boot () {
+  const on = {
+    style: inject
+  }
   const [opts] = await sdb.watch(onbatch)
-  document.body.append(await app(opts))
+  const el = document.body
+  const shadow = el.attachShadow({ mode: 'closed' })
+  shadow.adoptedStyleSheets = [sheet]
+  shadow.append(await app(opts))
+
+  async function onbatch (batch) {
+    for (const { type, paths } of batch) {
+      const data = await Promise.all(paths.map(path => drive.get(path).then(file => file.raw)))
+      const func = on[type] || fail
+      func(data, type)
+    }
+  }
+  function fail (data, type) { console.warn('page: invalid batch', { cause: { data, type } }) }
 }
-function onbatch (batch) {}
+function inject (data) { sheet.replaceSync(data.join('\n')) }
 
 function defaults () {
   // every dataset of app has to be mapped to a dataset of the page
@@ -45,6 +63,9 @@ function defaults () {
   for (const name of datasets) {
     mapping[name] = name
     drive[`${name}/`] = {}
+  }
+  drive['style/'] = {
+    'demo.css': { $ref: '../src/node_modules/css/default/demo.css' }
   }
   return {
     _: {

@@ -29,7 +29,6 @@ async function app (opts) {
   <button class="devkit-toggle">devkit</button>`
   const sheet = new CSSStyleSheet()
   shadow.adoptedStyleSheets = [sheet]
-  document.adoptedStyleSheets = [sheet]
   const site = shadow.querySelector('.site')
   const devkit = shadow.querySelector('.devkit')
   const toggle = shadow.querySelector('.devkit-toggle')
@@ -129,7 +128,6 @@ function defaults () {
   const mapping = { style: 'style' }
   const drive = {
     'style/': {
-      'demo.css': { $ref: 'node_modules/css/default/demo.css' },
       'app.css': { $ref: 'node_modules/css/default/app.css' },
       'devkit.css': { $ref: 'node_modules/css/default/devkit.css' }
     },
