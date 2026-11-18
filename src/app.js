@@ -24,7 +24,7 @@ async function app (opts) {
   const el = document.createElement('div')
   const shadow = el.attachShadow({ mode: 'closed' })
   shadow.innerHTML = `
-  <div class="wrap site"></div>
+  <div id="top" class="wrap site"></div>
   <aside class="devkit"></aside>
   <button class="devkit-toggle">devkit</button>`
   const sheet = new CSSStyleSheet()
@@ -83,9 +83,9 @@ async function app (opts) {
   }
   function jump (msg) {
     const { to } = msg.data
-    if (to === 'top') return window.scrollTo({ top: 0, behavior: 'smooth' })
-    if (!sections[to]) return console.info(`app: section "${to}" is not on the page yet`)
-    _[to]('scroll', { cause: msg.head })
+    const target = shadow.querySelector('#' + to)
+    if (!target) return console.info(`app: section "${to}" is not on the page yet`)
+    target.scrollIntoView({ behavior: 'smooth' })
   }
 
   function io_theme_widget () {
