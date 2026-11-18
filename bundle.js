@@ -10931,9 +10931,7 @@ function fallback_module () {
 (function (__filename){(function (){
 const STATE = require('STATE')
 const statedb = STATE(__filename)
-statedb.admin()
-const { sdb, id } = statedb(defaults)
-const { drive } = sdb
+const { get } = statedb(defaults)
 const net = require('net_helper')
 const DOCS = require('DOCS')
 const docs_admin = DOCS(__filename)().admin
@@ -10947,7 +10945,9 @@ const sections = { topnav, header, footer }
 
 module.exports = app
 
-async function app () {
+async function app (opts) {
+  const { id, sdb } = await get(opts.sid)
+  const { drive } = sdb
   const on = {
     style: inject,
     devkit: show_devkit
@@ -10955,12 +10955,11 @@ async function app () {
   const el = document.createElement('div')
   const shadow = el.attachShadow({ mode: 'closed' })
   shadow.innerHTML = `
-  <div class="wrap site"></div>
+  <div id="top" class="wrap site"></div>
   <aside class="devkit"></aside>
   <button class="devkit-toggle">devkit</button>`
   const sheet = new CSSStyleSheet()
   shadow.adoptedStyleSheets = [sheet]
-  document.adoptedStyleSheets = [sheet]
   const site = shadow.querySelector('.site')
   const devkit = shadow.querySelector('.devkit')
   const toggle = shadow.querySelector('.devkit-toggle')
@@ -11015,9 +11014,9 @@ async function app () {
   }
   function jump (msg) {
     const { to } = msg.data
-    if (to === 'top') return window.scrollTo({ top: 0, behavior: 'smooth' })
-    if (!sections[to]) return console.info(`app: section "${to}" is not on the page yet`)
-    _[to]('scroll', { cause: msg.head })
+    const target = shadow.querySelector('#' + to)
+    if (!target) return console.info(`app: section "${to}" is not on the page yet`)
+    target.scrollIntoView({ behavior: 'smooth' })
   }
 
   function io_theme_widget () {
@@ -11060,9 +11059,7 @@ function defaults () {
   const mapping = { style: 'style' }
   const drive = {
     'style/': {
-      'demo.css': { $ref: 'node_modules/css/default/demo.css' },
-      'app.css': { $ref: 'node_modules/css/default/app.css' },
-      'devkit.css': { $ref: 'node_modules/css/default/devkit.css' }
+      'app.css': { $ref: 'node_modules/css/default/app.css' }
     },
     'content/': {},
     // tabs inside devkit maps a "count" dataset up to the root
@@ -11076,15 +11073,29 @@ function defaults () {
     drive[`${name}/`] = {}
   }
   return {
+    api,
     _: {
-      net_helper: 0,
-      DOCS: 0,
-      topnav: section,
-      header: section,
-      footer: section,
-      theme_widget: { $: '', 0: '', mapping }
+      net_helper: { $: '' },
+      DOCS: { $: '' },
+      topnav: { $: '' },
+      header: { $: '' },
+      footer: { $: '' },
+      theme_widget: { $: '' }
     },
-    drive
+    drive: {}
+  }
+  function api () {
+    return {
+      _: {
+        net_helper: { 0: '' },
+        DOCS: { 0: '' },
+        topnav: section,
+        header: section,
+        footer: section,
+        theme_widget: { $: '', 0: '', mapping }
+      },
+      drive
+    }
   }
 }
 
@@ -11459,7 +11470,14 @@ function defaults () {
 
 }).call(this)}).call(this,"/src/node_modules/topnav/topnav.js")
 },{"STATE":1,"graphic":31,"net_helper":18}],35:[function(require,module,exports){
+(function (__filename){(function (){
+const STATE = require('STATE')
+const statedb = STATE(__filename)
+statedb.admin()
+const { sdb } = statedb(defaults)
+const { drive } = sdb
 const app = require('../src/app')
+const sheet = new CSSStyleSheet()
 config().then(boot)
 
 async function config () {
@@ -11479,11 +11497,62 @@ async function config () {
     <link href="${font}" rel="stylesheet" type="text/css">`)
   document.title = 'Playproject.io'
   document.body.removeAttribute('style')
+  document.adoptedStyleSheets = [sheet]
   await document.fonts.ready
 }
 
 async function boot () {
-  document.body.append(await app())
+  const on = {
+    style: inject
+  }
+  const [opts] = await sdb.watch(onbatch)
+  const el = document.body
+  const shadow = el.attachShadow({ mode: 'closed' })
+  shadow.adoptedStyleSheets = [sheet]
+  shadow.append(await app(opts))
+
+  async function onbatch (batch) {
+    for (const { type, paths } of batch) {
+      const data = await Promise.all(paths.map(path => drive.get(path).then(file => file.raw)))
+      const func = on[type] || fail
+      func(data, type)
+    }
+  }
+  function fail (data, type) { console.warn('page: invalid batch', { cause: { data, type } }) }
+}
+function inject (data) { sheet.replaceSync(data.join('\n')) }
+
+function defaults () {
+  // every dataset of app has to be mapped to a dataset of the page
+  const datasets = [
+    'style', 'content', 'count', 'devkit',
+    'commands', 'icons', 'scroll', 'actions', 'hardcons', 'files', 'highlight',
+    'active_tab', 'entries', 'runtime', 'mode', 'flags', 'keybinds', 'undo',
+    'focused', 'temp_actions', 'temp_quick_actions', 'prefs', 'variables',
+    'data', 'docs_style', 'docs'
+  ]
+  const mapping = {}
+  const drive = {}
+  for (const name of datasets) {
+    mapping[name] = name
+    drive[`${name}/`] = {}
+  }
+  drive['style/'] = {
+    'demo.css': { $ref: '../src/node_modules/css/default/demo.css' }
+  }
+  return {
+    _: {
+      '../src/app': { $: '', 0: override_app, mapping }
+    },
+    drive
+  }
+  // the page's own style for the devkit panel, the $ref is relative to web/
+  function override_app (args, tools, [app]) {
+    const data = app()
+    data.drive['style/']['devkit.css'] = { $ref: 'devkit.css' }
+    return data
+  }
 }
 
-},{"../src/app":29}]},{},[35]);
+}).call(this)}).call(this,"/web/page.js")
+},{"../src/app":29,"STATE":1}]},{},[35]);
