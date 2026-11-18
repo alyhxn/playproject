@@ -1,8 +1,6 @@
 const STATE = require('STATE')
 const statedb = STATE(__filename)
-statedb.admin()
-const { sdb, id } = statedb(defaults)
-const { drive } = sdb
+const { get } = statedb(defaults)
 const net = require('net_helper')
 const DOCS = require('DOCS')
 const docs_admin = DOCS(__filename)().admin
@@ -16,7 +14,9 @@ const sections = { topnav, header, footer }
 
 module.exports = app
 
-async function app () {
+async function app (opts) {
+  const { id, sdb } = await get(opts.sid)
+  const { drive } = sdb
   const on = {
     style: inject,
     devkit: show_devkit
@@ -145,14 +145,28 @@ function defaults () {
     drive[`${name}/`] = {}
   }
   return {
+    api,
     _: {
-      net_helper: 0,
-      DOCS: 0,
-      topnav: section,
-      header: section,
-      footer: section,
-      theme_widget: { $: '', 0: '', mapping }
+      net_helper: { $: '' },
+      DOCS: { $: '' },
+      topnav: { $: '' },
+      header: { $: '' },
+      footer: { $: '' },
+      theme_widget: { $: '' }
     },
-    drive
+    drive: {}
+  }
+  function api () {
+    return {
+      _: {
+        net_helper: 0,
+        DOCS: 0,
+        topnav: section,
+        header: section,
+        footer: section,
+        theme_widget: { $: '', 0: '', mapping }
+      },
+      drive
+    }
   }
 }
